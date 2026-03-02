@@ -181,7 +181,7 @@ pytest tests/test_engine_env_wf_oidc.py -v
 pytest tests/ -v --tb=long -s
 ```
 
-251 tests, ~10K lines of Python.
+319 tests, ~11K lines of Python.
 
 ## Adding New Rules
 
@@ -209,4 +209,4 @@ Then import the module in `ghostgates/engine/__init__.py` and it auto-registers.
 
 ## License
 
-Private / proprietary.
+MIT License. See [LICENSE](LICENSE) for details.
