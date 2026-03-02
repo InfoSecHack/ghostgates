@@ -1,0 +1,54 @@
+# ------------------------------------------------------------------
+# GhostGates .gitignore
+# ------------------------------------------------------------------
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment / secrets
+.env
+.env.*
+
+# SQLite databases (may contain collected data)
+*.db
+*.db-shm
+*.db-wal
+
+# Test / coverage
+.pytest_cache/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+
+# Output artifacts
+*.json
+*.md
+!README.md
+!ARCHITECTURE.md
+!SECURITY.md
+!CONTRIBUTING.md
+
+# Logs
+*.log
