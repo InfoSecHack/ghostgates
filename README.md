@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
-![Tests](https://img.shields.io/badge/tests-319-green)
+![Tests](https://img.shields.io/badge/tests-418-green)
 ![Status](https://img.shields.io/badge/status-beta-orange)
 
 GhostGates is a CI/CD security analysis tool that identifies **structural bypass paths** in GitHub Actions workflows, branch protections, environments, rulesets, and OIDC trust policies.
@@ -18,10 +18,15 @@ Traditional CI/CD scanners detect **misconfigurations**. GhostGates models **how
 - [Why GhostGates Exists](#why-ghostgates-exists)
 - [Quick Start](#quick-start)
 - [What GhostGates Detects](#what-ghostgates-detects)
+- [Example Output](#example-output)
 - [Example Finding](#example-finding)
 - [Threat Model](#threat-model)
 - [Installation](#installation)
 - [Usage](#usage)
+- [Risk Ranking](#risk-ranking)
+- [Policy Audit](#policy-audit)
+- [Output Formats](#output-formats)
+- [GitHub Action](#github-action)
 - [Token Permissions](#token-permissions)
 - [Rule Catalog](#rule-catalog-15-rules)
 - [Architecture](#architecture)
@@ -72,7 +77,55 @@ Each finding includes:
 - **Bypass path** — numbered attack steps showing exactly how the gate is bypassed
 - **Evidence** — raw configuration values proving the bypass exists
 - **Attacker level** — minimum privilege needed (external → org-owner)
-- **Remediation** — specific fix with configuration guidance
+- **Remediation** — specific fix with configuration guidance and direct settings URL
+- **Instance key** — unique identifier (rule + repo + context) for stable tracking across scans
+
+---
+
+## Example Output
+
+### Risk Ranking
+
+```
+╔══════════════════════════════════════════════════════╗
+║  GhostGates Risk Ranking                             ║
+╚══════════════════════════════════════════════════════╝
+
+  Organization:  my-org
+  Repos ranked:  3
+
+    #  Repository                    Score   Tier       Findings     Flags
+  ─────────────────────────────────────────────────────────────────────────
+    1  my-org/payments-api            282    CRITICAL   1C 10H 7M 1L  ⚠ external  ⚠ OIDC  ⚠ prod
+    2  my-org/web-app                  47    HIGH       2H 1M
+    3  my-org/docs                      2    LOW        1L
+
+  Total risk: 331 across 3 repos
+  1 CRITICAL-tier repos
+```
+
+### Policy Audit
+
+```
+╔══════════════════════════════════════════════════════╗
+║  GhostGates Policy Audit                             ║
+╚══════════════════════════════════════════════════════╝
+
+  Policy:      ghostgates-policy.yml
+  Repos:       47 in scope (3 excluded)
+  Compliant:   31/47 (66%)
+  Total gaps:  14
+
+  ── Policy Gaps ──
+
+  my-org/payments-api    3 gaps
+    ✗ 🔒 enforce_admins: false (expected: true) [main]
+    ✗ ⚙️ max_default_permissions: write (expected: read)
+    ✗ 🔑 require_environment_claim: missing
+
+  ── Compliant ──
+    ✓ 31 repos fully compliant
+```
 
 ---
 
@@ -168,8 +221,14 @@ ghostgates scan --org my-org
 # Scan specific repos with verbose output
 ghostgates scan --org my-org --repos api,web -v
 
+# Scan with risk ranking appended
+ghostgates scan --org my-org --rank
+
 # JSON output for CI integration
 ghostgates scan --org my-org --format json > report.json
+
+# SARIF output for GitHub Code Scanning
+ghostgates scan --org my-org --format sarif > results.sarif
 
 # Markdown report
 ghostgates scan --org my-org --format md -o report.md
@@ -233,7 +292,194 @@ ghostgates diff --org my-org --old-id 3 --new-id 5
 | `0` | No new findings since last scan |
 | `1` | New findings introduced |
 
-Designed for CI/CD pipeline integration — fail the build when critical bypasses exist.
+**audit:**
+
+| Code | Meaning |
+|------|---------|
+| `0` | All repos compliant |
+| `1` | Policy gaps found |
+
+Designed for CI/CD pipeline integration — fail the build when critical bypasses exist or policy gaps are detected.
+
+---
+
+## Risk Ranking
+
+Aggregate findings per repo into weighted risk scores for prioritization. Addresses the "wall of findings" problem on large orgs.
+
+```bash
+# Standalone (uses latest stored scan)
+ghostgates rank --org my-org
+ghostgates rank --org my-org --format json
+ghostgates rank --org my-org --top 10
+
+# Appended to scan output
+ghostgates scan --org my-org --rank
+```
+
+**Scoring algorithm:**
+
+Each finding contributes a base score by severity: CRITICAL (50), HIGH (20), MEDIUM (7), LOW (2), INFO (0). Bonus points are added for structural risk factors:
+
+- **+25** if any finding is reachable by an external attacker (no credentials)
+- **+15** if any OIDC finding exists (cloud credential risk)
+- **+10** if a production environment is involved
+
+Repos are tiered: CRITICAL (≥75), HIGH (≥40), MEDIUM (≥15), LOW (<15).
+
+---
+
+## Policy Audit
+
+Define your organization's security standard in a YAML file, then measure compliance across every repo. This is the feature that produces SOC2 evidence, ISO 27001 audit artifacts, and board-level compliance percentages.
+
+No other open-source tool lets you define YOUR policy and measure it.
+
+```bash
+# Live scan + audit
+ghostgates audit --org my-org --policy ghostgates-policy.yml
+
+# Audit against stored data (no API calls)
+ghostgates audit --org my-org --policy ghostgates-policy.yml --offline
+
+# JSON for CI pipelines
+ghostgates audit --org my-org --policy ghostgates-policy.yml --format json
+
+# Markdown for reports
+ghostgates audit --org my-org --policy ghostgates-policy.yml --format md -o audit.md
+```
+
+### Policy File Format
+
+Copy `ghostgates-policy.example.yml` and customize for your org. Only fields you explicitly set are enforced:
+
+```yaml
+# ghostgates-policy.yml
+policy:
+  branch_protection:
+    enforce_admins: true
+    dismiss_stale_reviews: true
+    min_reviewers: 2
+    require_codeowners: true
+    require_status_checks: true
+    block_force_pushes: true
+
+  environments:
+    "prod.*":                           # regex pattern matching env names
+      required_reviewers: true
+      restrict_branches: true
+      min_wait_timer: 5
+    "staging":
+      required_reviewers: true
+
+  workflows:
+    max_default_permissions: read
+    block_pull_request_target: true
+    block_secrets_inherit: true
+    block_write_all: true
+    block_pr_approval: true
+
+  oidc:
+    require_custom_template: true
+    require_environment_claim: true
+
+scope:
+  include: [".*"]                       # all repos
+  exclude: ["docs", ".*-sandbox"]       # skip these
+```
+
+**17 policy checks** across branch protection, environments, workflows, and OIDC.
+
+### Three Views, Same Data
+
+GhostGates gives security teams three complementary perspectives from a single scan:
+
+| Command | Perspective | Audience |
+|---------|-------------|----------|
+| `ghostgates scan` | What's exploitable and how | Red team, AppSec |
+| `ghostgates rank` | Where to fix first | Security engineering, triage |
+| `ghostgates audit` | Are we meeting our standard | CISO, compliance, auditors |
+
+---
+
+## Output Formats
+
+| Format | Flag | Use Case |
+|--------|------|----------|
+| Terminal | `--format terminal` (default) | Interactive review |
+| JSON | `--format json` | CI integration, programmatic analysis |
+| Markdown | `--format md` | Reports, documentation |
+| SARIF | `--format sarif` | GitHub Code Scanning / Security tab |
+
+### SARIF Integration
+
+Generate SARIF 2.1.0 output for native GitHub Code Scanning integration. Findings appear in the Security tab alongside CodeQL and Dependabot:
+
+```bash
+# Generate SARIF
+ghostgates scan --org my-org --format sarif > results.sarif
+
+# Upload to GitHub Code Scanning
+gh api -X POST /repos/{owner}/{repo}/code-scanning/sarifs \
+  --field "sarif=$(gzip -c results.sarif | base64 -w0)" \
+  --field "ref=refs/heads/main"
+```
+
+Each SARIF result includes a stable fingerprint (`rule_id|repo|instance`) for deduplication across scans.
+
+---
+
+## GitHub Action
+
+Drop this workflow into any repo to get automated weekly scans with results in the GitHub Security tab:
+
+```yaml
+# .github/workflows/ghostgates-scan.yml
+name: GhostGates CI/CD Security Scan
+
+on:
+  schedule:
+    - cron: '0 9 * * 1'            # Every Monday at 9am UTC
+  workflow_dispatch:                 # Manual trigger
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  ghostgates:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install GhostGates
+        run: |
+          pip install git+https://github.com/InfoSecHack/ghostgates.git
+
+      - name: Run scan (SARIF)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GHOSTGATES_TOKEN }}
+        run: |
+          ghostgates scan --org ${{ github.repository_owner }} --format sarif > results.sarif
+
+      - name: Upload SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif
+          category: ghostgates
+
+      - name: Show risk ranking
+        env:
+          GITHUB_TOKEN: ${{ secrets.GHOSTGATES_TOKEN }}
+        run: |
+          ghostgates rank --org ${{ github.repository_owner }}
+
+      - name: Upload scan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghostgates-scan
+          path: results.sarif
+```
+
+**Required secret:** `GHOSTGATES_TOKEN` — a GitHub PAT with `repo` + `read:org` scopes.
 
 ---
 
@@ -301,11 +547,23 @@ Collectors (org, repos, environments, workflows)
     ↓
 GateModel (per-repo structured data)
     ↓
-Rule Engine (15 bypass rules, decorator-registered)
-    ↓
-Findings (evidence-backed, attacker-level parameterized)
-    ↓
-Output (terminal / JSON / markdown)
+┌─────────────────────────────────────────┐
+│           Rule Engine (15 rules)        │
+│   decorator-registered, attacker-level  │
+│         parameterized                   │
+└─────────────────────────────────────────┘
+    ↓                    ↓
+Findings              GateModel
+    ↓                    ↓
+┌──────────┐     ┌──────────────┐
+│ Reporting│     │ Policy Audit │
+│          │     │              │
+│ terminal │     │ YAML policy  │
+│ JSON     │     │ 17 checks    │
+│ markdown │     │ compliance % │
+│ SARIF    │     └──────────────┘
+│ rank     │
+└──────────┘
 ```
 
 Key design principles:
@@ -314,6 +572,7 @@ Key design principles:
 - **Decorator-based rules** — `@registry.rule(...)` auto-registers rules, filterable by attacker level and gate type.
 - **Evidence-first** — Every finding includes the raw config values that prove the bypass.
 - **Attacker modeling** — Findings are parameterized by minimum privilege level, not just severity.
+- **Policy-as-code** — Define your security standard in YAML, measure compliance programmatically.
 - **Fail-safe parsing** — The workflow YAML parser never crashes; malformed files produce `parse_errors`, not exceptions.
 
 ---
@@ -328,11 +587,16 @@ pytest tests/ -v
 pytest tests/test_engine_bp_rules.py -v
 pytest tests/test_engine_env_wf_oidc.py -v
 
+# Run new feature tests
+pytest tests/test_rank.py -v
+pytest tests/test_sarif.py -v
+pytest tests/test_policy_audit.py -v
+
 # Run with debug output
 pytest tests/ -v --tb=long -s
 ```
 
-319 tests, ~11K lines of Python.
+418 tests, ~14K lines of Python.
 
 ---
 
@@ -362,11 +626,26 @@ Then import the module in `ghostgates/engine/__init__.py` and it auto-registers.
 
 ---
 
+## How GhostGates Compares
+
+| Tool | What it does | Approach |
+|------|-------------|----------|
+| [Gato](https://github.com/praetorian-inc/gato) | Exploits GitHub Actions (self-hosted runners, secret exfil) | Offensive exploitation |
+| [GitOops](https://github.com/ovotech/gitoops) | Maps user→repo→secret graph paths in Neo4j | Graph traversal (archived) |
+| [Actions Attack Diagram](https://github.com/jstawinski/GitHub-Actions-Attack-Diagram) | Reference flowchart of Actions attack paths | Educational diagram |
+| **GhostGates** | Audits structural bypass paths + policy compliance | Defensive analysis |
+
+Gato exploits. GitOops maps. GhostGates audits. They solve different problems.
+
+GhostGates is the only tool that unifies branch protections + environments + workflows + OIDC + rulesets into a single structural analysis with attacker-level parameterization and policy-as-code compliance measurement.
+
+---
+
 ## Roadmap
 
 - GitLab CI support
 - Azure DevOps pipelines
-- SARIF output
+- PyPI package (`pip install ghostgates`)
 - Expanded rule catalog
 - Pipeline security benchmarking
 - Attack graph visualization
