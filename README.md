@@ -22,6 +22,18 @@ Requires Python 3.11+.
 
 ## Usage
 
+### Authentication
+
+Set your GitHub token as an environment variable (recommended):
+```bash
+export GITHUB_TOKEN=ghp_your_token_here
+```
+
+Or pass it directly (not recommended — appears in shell history):
+```bash
+ghostgates scan --org my-org --token ghp_xxx
+```
+
 ### Live scan (requires GitHub token)
 
 ```bash
