@@ -2,7 +2,6 @@
 
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
-![Tests](https://img.shields.io/badge/tests-450-green)
 ![Status](https://img.shields.io/badge/status-beta-orange)
 
 GhostGates is a CI/CD security analysis tool that identifies **structural bypass paths** in GitHub Actions workflows, branch protections, environments, rulesets, and OIDC trust policies.
@@ -17,8 +16,8 @@ Traditional CI/CD scanners detect **misconfigurations**. GhostGates models **how
 
 - [Why GhostGates Exists](#why-ghostgates-exists)
 - [Quick Start](#quick-start)
-- [What GhostGates Detects](#what-ghostgates-detects)
 - [Example Output](#example-output)
+- [What GhostGates Detects](#what-ghostgates-detects)
 - [Example Finding](#example-finding)
 - [Threat Model](#threat-model)
 - [Installation](#installation)
@@ -33,6 +32,7 @@ Traditional CI/CD scanners detect **misconfigurations**. GhostGates models **how
 - [Architecture](#architecture)
 - [Development](#development)
 - [Adding New Rules](#adding-new-rules)
+- [How GhostGates Compares](#how-ghostgates-compares)
 - [Roadmap](#roadmap)
 - [License](#license)
 
@@ -68,18 +68,6 @@ pip install -e .
 export GITHUB_TOKEN=ghp_your_token_here
 ghostgates scan --org my-org
 ```
-
----
-
-## What GhostGates Detects
-
-Each finding includes:
-
-- **Bypass path** — numbered attack steps showing exactly how the gate is bypassed
-- **Evidence** — raw configuration values proving the bypass exists
-- **Attacker level** — minimum privilege needed (external → org-owner)
-- **Remediation** — specific fix with configuration guidance and direct settings URL
-- **Instance key** — unique identifier (rule + repo + context) for stable tracking across scans
 
 ---
 
@@ -127,6 +115,41 @@ Each finding includes:
   ── Compliant ──
     ✓ 31 repos fully compliant
 ```
+
+### Attack Surface (Recon)
+
+```
+╔══════════════════════════════════════════════════════╗
+║  GhostGates Attack Surface                           ║
+╚══════════════════════════════════════════════════════╝
+
+  ── Attacker-Controlled Workflow Execution ──  (requires: NO CREDS)
+
+    my-org/payments-api
+      → PR head checkout in pr_target_unsafe.yml  (GHOST-WF-001)
+
+  ── Secrets Exposure ──  (requires: NO CREDS)
+
+    my-org/payments-api
+      → secrets: inherit → deploy.yml (deploy_unsafe.yml)  (GHOST-WF-003)
+
+  ── Cloud Credential Theft (OIDC) ──  (requires: repo-write)
+
+    my-org/payments-api
+      → id-token: write without env gate (oidc_deploy.yml#deploy-aws)  (GHOST-OIDC-002)
+```
+
+---
+
+## What GhostGates Detects
+
+Each finding includes:
+
+- **Bypass path** — numbered attack steps showing exactly how the gate is bypassed
+- **Evidence** — raw configuration values proving the bypass exists
+- **Attacker level** — minimum privilege needed (external → org-owner)
+- **Remediation** — specific fix with configuration guidance and direct settings URL
+- **Instance key** — unique identifier (rule + repo + context) for stable tracking across scans
 
 ---
 
@@ -334,7 +357,7 @@ Repos are tiered: CRITICAL (≥75), HIGH (≥40), MEDIUM (≥15), LOW (<15).
 
 Define your organization's security standard in a YAML file, then measure compliance across every repo. This is the feature that produces SOC2 evidence, ISO 27001 audit artifacts, and board-level compliance percentages.
 
-No other open-source tool lets you define YOUR policy and measure it.
+Rare among open-source CI/CD tools — most check generic best practices. GhostGates audit checks YOUR policy.
 
 ```bash
 # Live scan + audit
@@ -391,7 +414,7 @@ scope:
 
 **17 policy checks** across branch protection, environments, workflows, and OIDC.
 
-### Three Views, Same Data
+### Four Views, Same Data
 
 GhostGates gives security teams four complementary perspectives from a single scan:
 
@@ -430,40 +453,6 @@ ghostgates recon --org my-org --format md -o recon.md
 | Production Deployment Paths | Which workflows can deploy to production? |
 | Review Bypass Paths | Which repos have circumventable branch protections? |
 
-Example output:
-
-```
-╔══════════════════════════════════════════════════════╗
-║  GhostGates Attack Surface                           ║
-╚══════════════════════════════════════════════════════╝
-
-  Organization:  my-org
-  Findings:      19
-  Repos exposed: 3
-
-  ── Attacker-Controlled Workflow Execution ──  (requires: NO CREDS)
-  Which repos allow attacker-controlled code execution in workflows?
-
-    my-org/payments-api
-      → PR head checkout in pr_target_unsafe.yml  (GHOST-WF-001)
-
-  ── Secrets Exposure ──  (requires: NO CREDS)
-  Which pipelines expose secrets to untrusted contexts?
-
-    my-org/payments-api
-      → secrets: inherit → deploy.yml (deploy_unsafe.yml)  (GHOST-WF-003)
-      → fork PR secrets via workflow_run (post_ci_deploy.yml)  (GHOST-WF-004)
-
-  ── Cloud Credential Theft (OIDC) ──  (requires: repo-write)
-  Which repos allow unauthorized cloud role assumption?
-
-    my-org/payments-api
-      → id-token: write without env gate (oidc_deploy.yml#deploy-aws)  (GHOST-OIDC-002)
-
-  ── Clean ──
-    ✓ Production Deployment Paths
-```
-
 No new API calls. No new rules. Zero additional scan time.
 
 ---
@@ -497,7 +486,7 @@ Each SARIF result includes a stable fingerprint (`rule_id|repo|instance`) for de
 
 ## GitHub Action
 
-Drop this workflow into any repo to get automated weekly scans with results in the GitHub Security tab:
+Recommended for org owners who want weekly SARIF results in the GitHub Security tab.
 
 ```yaml
 # .github/workflows/ghostgates-scan.yml
@@ -517,47 +506,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Install GhostGates
-        run: |
-          pip install git+https://github.com/InfoSecHack/ghostgates.git
+        run: pip install git+https://github.com/InfoSecHack/ghostgates.git
 
       - name: Run scan (SARIF)
         env:
           GITHUB_TOKEN: ${{ secrets.GHOSTGATES_TOKEN }}
-        run: |
-          ghostgates scan --org ${{ github.repository_owner }} --format sarif > results.sarif
+        run: ghostgates scan --org ${{ github.repository_owner }} --format sarif > results.sarif
 
       - name: Upload SARIF to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: results.sarif
           category: ghostgates
-
-      - name: Show risk ranking
-        env:
-          GITHUB_TOKEN: ${{ secrets.GHOSTGATES_TOKEN }}
-        run: |
-          ghostgates rank --org ${{ github.repository_owner }}
-
-      - name: Upload scan artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ghostgates-scan
-          path: results.sarif
 ```
 
-**Required secret:** `GHOSTGATES_TOKEN` — a GitHub PAT with `repo` + `read:org` scopes.
+**Required secret:** `GHOSTGATES_TOKEN` — a classic PAT with `repo` + `read:org` scopes, or a fine-grained PAT with Repository Read + Organization Read permissions.
 
 ---
 
 ## Token Permissions
 
-Required scopes:
+**Classic PAT:** `repo` + `read:org`. Optionally `admin:repo_hook` for webhook-based environment protections.
 
-- `repo` — read branch protections, collaborators, rulesets
-- `read:org` — org Actions permissions, OIDC templates
-- `admin:repo_hook` — optional, for webhook-based environment protections
-
-Fine-grained tokens work with `Repository: Read` + `Organization: Read` permissions.
+**Fine-grained PAT:** Repository Read + Organization Read permissions.
 
 **Token safety:** Tokens are never logged, stored in the database, or included in error messages. All error paths scrub token patterns before raising.
 
@@ -629,6 +600,7 @@ Findings              GateModel
 │ markdown │     │ compliance % │
 │ SARIF    │     └──────────────┘
 │ rank     │
+│ recon    │
 └──────────┘
 ```
 
@@ -704,7 +676,7 @@ Then import the module in `ghostgates/engine/__init__.py` and it auto-registers.
 
 Gato exploits. GitOops maps. GhostGates audits. They solve different problems.
 
-GhostGates is the only tool that unifies branch protections + environments + workflows + OIDC + rulesets into a single structural analysis with attacker-level parameterization and policy-as-code compliance measurement.
+One of the few open-source tools that unifies branch protections + environments + workflows + OIDC + rulesets into a single structural analysis with attacker-level parameterization and policy-as-code compliance measurement.
 
 ---
 
