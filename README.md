@@ -31,26 +31,26 @@ export GITHUB_TOKEN=ghp_your_token_here
 
 Or pass it directly (not recommended — appears in shell history):
 ```bash
-ghostgates scan --org my-org --token ghp_xxx
+ghostgates scan --org my-org 
 ```
 
 ### Live scan (requires GitHub token)
 
 ```bash
 # Scan all repos in an org
-ghostgates scan --org my-org --token ghp_xxx
+ghostgates scan --org my-org 
 
 # Scan specific repos with verbose output
-ghostgates scan --org my-org --token ghp_xxx --repos api,web -v
+ghostgates scan --org my-org  --repos api,web -v
 
 # JSON output for CI integration
-ghostgates scan --org my-org --token ghp_xxx --format json > report.json
+ghostgates scan --org my-org  --format json > report.json
 
 # Markdown report
-ghostgates scan --org my-org --token ghp_xxx --format md -o report.md
+ghostgates scan --org my-org  --format md -o report.md
 
 # Simulate specific attacker level
-ghostgates scan --org my-org --token ghp_xxx --attacker repo-write
+ghostgates scan --org my-org  --attacker repo-write
 ```
 
 ### Offline analysis (no API calls)
