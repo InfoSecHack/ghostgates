@@ -17,8 +17,8 @@ Traditional CI/CD scanners detect **misconfigurations**. GhostGates models **how
 - [Why GhostGates Exists](#why-ghostgates-exists)
 - [Quick Start](#quick-start)
 - [Example Output](#example-output)
-- [What GhostGates Detects](#what-ghostgates-detects)
 - [Example Finding](#example-finding)
+- [What GhostGates Detects](#what-ghostgates-detects)
 - [Threat Model](#threat-model)
 - [Installation](#installation)
 - [Usage](#usage)
@@ -141,18 +141,6 @@ ghostgates scan --org my-org
 
 ---
 
-## What GhostGates Detects
-
-Each finding includes:
-
-- **Bypass path** — numbered attack steps showing exactly how the gate is bypassed
-- **Evidence** — raw configuration values proving the bypass exists
-- **Attacker level** — minimum privilege needed (external → org-owner)
-- **Remediation** — specific fix with configuration guidance and direct settings URL
-- **Instance key** — unique identifier (rule + repo + context) for stable tracking across scans
-
----
-
 ## Example Finding
 
 > **Note:** Simplified for readability. Actual terminal output formatting may differ.
@@ -190,6 +178,18 @@ Remediation:
   privileged context. If pull_request_target is required, perform
   all untrusted code execution in a separate unprivileged job.
 ```
+
+---
+
+## What GhostGates Detects
+
+Each finding includes:
+
+- **Bypass path** — numbered attack steps showing exactly how the gate is bypassed
+- **Evidence** — raw configuration values proving the bypass exists
+- **Attacker level** — minimum privilege needed (external → org-owner)
+- **Remediation** — specific fix with configuration guidance and direct settings URL
+- **Instance key** — unique identifier (rule + repo + context) for stable tracking across scans
 
 ---
 
@@ -357,7 +357,7 @@ Repos are tiered: CRITICAL (≥75), HIGH (≥40), MEDIUM (≥15), LOW (<15).
 
 Define your organization's security standard in a YAML file, then measure compliance across every repo. This is the feature that produces SOC2 evidence, ISO 27001 audit artifacts, and board-level compliance percentages.
 
-Rare among open-source CI/CD tools — most check generic best practices. GhostGates audit checks YOUR policy.
+Rare among open-source CI/CD tools, which typically check only generic best-practice configurations. GhostGates audit checks YOUR policy.
 
 ```bash
 # Live scan + audit
@@ -676,7 +676,7 @@ Then import the module in `ghostgates/engine/__init__.py` and it auto-registers.
 
 Gato exploits. GitOops maps. GhostGates audits. They solve different problems.
 
-One of the few open-source tools that unifies branch protections + environments + workflows + OIDC + rulesets into a single structural analysis with attacker-level parameterization and policy-as-code compliance measurement.
+Among the few open-source tools that analyze branch protections, environments, workflows, OIDC, and rulesets together as a single structural security model.
 
 ---
 
