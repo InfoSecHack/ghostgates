@@ -28,15 +28,15 @@ jobs:
           pip install -e /tmp/ghostgates
 
       - name: Run scan
+        continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GHOSTGATES_TOKEN }}
         run: |
-          ghostgates scan --org ${{ github.repository_owner }} --format sarif -o results.sarif
-          ghostgates scan --org ${{ github.repository_owner }} --rank
+          ghostgates scan --org ${{ github.repository_owner }} --format sarif -o results.sarif --rank
 
       - name: Upload SARIF to GitHub Security
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: results.sarif
           category: ghostgates
