@@ -25,10 +25,11 @@ Traditional CI/CD scanners detect **misconfigurations**. GhostGates models **how
 - [Risk Ranking](#risk-ranking)
 - [Policy Audit](#policy-audit)
 - [Recon (Attack Surface)](#recon-attack-surface)
+- [Kill Chain (Graph)](#kill-chain-graph)
 - [Output Formats](#output-formats)
 - [GitHub Action](#github-action)
 - [Token Permissions](#token-permissions)
-- [Rule Catalog](#rule-catalog-15-rules)
+- [Rule Catalog](#rule-catalog-19-rules)
 - [Architecture](#architecture)
 - [Development](#development)
 - [Adding New Rules](#adding-new-rules)
@@ -414,9 +415,9 @@ scope:
 
 **17 policy checks** across branch protection, environments, workflows, and OIDC.
 
-### Four Views, Same Data
+### Five Views, Same Data
 
-GhostGates gives security teams four complementary perspectives from a single scan:
+GhostGates gives security teams five complementary perspectives from a single scan:
 
 | Command | Perspective | Audience |
 |---------|-------------|----------|
@@ -424,6 +425,7 @@ GhostGates gives security teams four complementary perspectives from a single sc
 | `ghostgates rank` | Where to fix first | Security engineering, triage |
 | `ghostgates audit` | Are we meeting our standard | CISO, compliance, auditors |
 | `ghostgates recon` | What's my attack surface | Red team, pen test |
+| `ghostgates graph` | Show me the kill chain | Board decks, pen test reports |
 
 ---
 
@@ -442,7 +444,7 @@ ghostgates recon --org my-org --format json
 ghostgates recon --org my-org --format md -o recon.md
 ```
 
-**Six attack surface categories:**
+**Seven attack surface categories:**
 
 | Category | Question |
 |----------|----------|
@@ -452,8 +454,67 @@ ghostgates recon --org my-org --format md -o recon.md
 | Code to Prod Without Review | Which repos allow code to reach prod without human review? |
 | Production Deployment Paths | Which workflows can deploy to production? |
 | Review Bypass Paths | Which repos have circumventable branch protections? |
+| Supply Chain Injection | Which repos are vulnerable to upstream dependency poisoning? |
 
 No new API calls. No new rules. Zero additional scan time.
+
+---
+
+## Kill Chain (Graph)
+
+Generate Mermaid diagrams showing attack paths from entry to impact, with bypassed gates crossed out. The terminal output is for the person who fixes it. The diagram is for the person who funds fixing it.
+
+```bash
+# Terminal kill chain view
+ghostgates graph --org my-org
+
+# Mermaid markdown (renders in GitHub, Notion, docs)
+ghostgates graph --org my-org --format mermaid -o kill-chain.md
+
+# Single repo
+ghostgates graph --org my-org --repo payments-api --format mermaid
+
+# JSON for custom rendering
+ghostgates graph --org my-org --format json
+```
+
+Each diagram shows:
+
+🔵 **Entry points** — attacker privilege level (stadium shape)
+🔴 **Bypassed gates** — the control that failed, colored by severity (hexagon)
+🟣 **Impact** — what the attacker gets (double circle)
+
+Example Mermaid output for a repo:
+
+```mermaid
+graph LR
+    entry_external(["External Attacker\n(no credentials)"])
+    entry_repo_write(["Repo Write\n(compromised dev)"])
+    bypass_WF001{{"✗ pr_target.yml\npull_request_target\n+ head checkout"}}
+    bypass_BP001{{"✗ Branch Protection\nmain\nenforce_admins=false"}}
+    bypass_OIDC002{{"✗ OIDC in deploy.yml\naws: no env gate"}}
+    impact_code_exec((("Code Execution\n+ Secret Exfil")))
+    impact_unreviewed((("Unreviewed Code\nMerged to Main")))
+    impact_cloud((("Cloud Credentials\n(no env gate)")))
+
+    entry_external --> bypass_WF001
+    bypass_WF001 --> impact_code_exec
+    entry_repo_write --> bypass_BP001
+    bypass_BP001 --> impact_unreviewed
+    entry_repo_write --> bypass_OIDC002
+    bypass_OIDC002 --> impact_cloud
+
+    style entry_external fill:#1e40af,stroke:#1e3a8a,color:#fff
+    style entry_repo_write fill:#1e40af,stroke:#1e3a8a,color:#fff
+    style bypass_WF001 fill:#dc2626,stroke:#991b1b,color:#fff
+    style bypass_BP001 fill:#ea580c,stroke:#c2410c,color:#fff
+    style bypass_OIDC002 fill:#ea580c,stroke:#c2410c,color:#fff
+    style impact_code_exec fill:#7c3aed,stroke:#6d28d9,color:#fff
+    style impact_unreviewed fill:#7c3aed,stroke:#6d28d9,color:#fff
+    style impact_cloud fill:#7c3aed,stroke:#6d28d9,color:#fff
+```
+
+This is the slide in a pen test report. The thing a CISO forwards to their VP of Engineering.
 
 ---
 
@@ -509,16 +570,20 @@ jobs:
         run: pip install git+https://github.com/InfoSecHack/ghostgates.git
 
       - name: Run scan (SARIF)
+        continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GHOSTGATES_TOKEN }}
-        run: ghostgates scan --org ${{ github.repository_owner }} --format sarif > results.sarif
+        run: ghostgates scan --org ${{ github.repository_owner }} --format sarif -o results.sarif
 
       - name: Upload SARIF to GitHub Security
-        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: results.sarif
           category: ghostgates
 ```
+
+`continue-on-error: true` is required because the scan exits non-zero when findings exist (exit 1 = medium, exit 2 = high/critical). Without it, GitHub Actions skips the upload step even with `if: always()`.
 
 **Required secret:** `GHOSTGATES_TOKEN` — a classic PAT with `repo` + `read:org` scopes, or a fine-grained PAT with Repository Read + Organization Read permissions.
 
@@ -534,7 +599,7 @@ jobs:
 
 ---
 
-## Rule Catalog (15 rules)
+## Rule Catalog (19 rules)
 
 ### Branch Protection (6 rules)
 
@@ -557,7 +622,7 @@ jobs:
 | GHOST-ENV-002 | Environment allows deployment from any branch | MEDIUM | repo-write |
 | GHOST-ENV-003 | Wait timer as only protection (auto-approve) | MEDIUM | repo-write |
 
-### Workflow (4 rules)
+### Workflow (8 rules)
 
 | ID | Rule | Severity | Min Privilege |
 |----|------|----------|---------------|
@@ -565,6 +630,12 @@ jobs:
 | GHOST-WF-002 | Workflow with write-all permissions | HIGH | repo-write |
 | GHOST-WF-003 | Reusable workflow with `secrets: inherit` | HIGH | repo-write |
 | GHOST-WF-004 | Workflow exposes secrets to fork PRs | HIGH | external |
+| GHOST-WF-005 | Unpinned third-party action references (tag poisoning) | HIGH | external |
+| GHOST-WF-006 | `workflow_dispatch` with write permissions (stolen PAT → RCE) | HIGH | repo-write |
+| GHOST-WF-007 | `contents:write` without environment gate (repo takeover) | HIGH | repo-write |
+| GHOST-WF-008 | Package/release publish without environment gate | HIGH | repo-write |
+
+> **On supply chain rules (WF-005 through WF-008):** These four rules were added after the March 2026 Trivy supply chain attack, where a stolen PAT was used to delete releases, overwrite the repo, and publish a malicious VS Code extension. The same campaign hit Microsoft, DataDog, and CNCF repos. WF-005 catches the unpinned action vector. WF-006 catches the stolen PAT + dispatch vector. WF-007 catches the contents:write blast radius amplifier. WF-008 catches the malicious publish vector.
 
 ### OIDC (2 rules)
 
@@ -585,7 +656,7 @@ Collectors (org, repos, environments, workflows)
 GateModel (per-repo structured data)
     ↓
 ┌─────────────────────────────────────────┐
-│           Rule Engine (15 rules)        │
+│           Rule Engine (19 rules)        │
 │   decorator-registered, attacker-level  │
 │         parameterized                   │
 └─────────────────────────────────────────┘
@@ -601,6 +672,7 @@ Findings              GateModel
 │ SARIF    │     └──────────────┘
 │ rank     │
 │ recon    │
+│ graph    │
 └──────────┘
 ```
 
@@ -630,12 +702,14 @@ pytest tests/test_rank.py -v
 pytest tests/test_sarif.py -v
 pytest tests/test_policy_audit.py -v
 pytest tests/test_recon.py -v
+pytest tests/test_graph.py -v
+pytest tests/test_supply_chain_rules.py -v
 
 # Run with debug output
 pytest tests/ -v --tb=long -s
 ```
 
-450 tests, ~15K lines of Python.
+516 tests, ~17K lines of Python.
 
 ---
 
@@ -687,7 +761,6 @@ Among the few open-source tools that analyze branch protections, environments, w
 - PyPI package (`pip install ghostgates`)
 - Expanded rule catalog
 - Pipeline security benchmarking
-- Attack graph visualization
 
 ---
 
