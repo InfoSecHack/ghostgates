@@ -10,6 +10,18 @@ Traditional CI/CD scanners detect **misconfigurations**. GhostGates models **how
 
 ![GhostGates scan output showing CI/CD gate bypass findings](docs/screenshot.png)
 
+*Example terminal output from a GhostGates scan.*
+
+## Features
+
+- Structural CI/CD gate bypass detection (not just misconfiguration scanning)
+- Attacker capability threat modeling with minimum privilege levels
+- Risk ranking across repositories
+- Policy-as-code compliance auditing
+- Red team attack surface recon
+- Kill chain graph visualization (Mermaid)
+- SARIF output for GitHub Code Scanning
+
 ---
 
 ## Table of Contents
@@ -514,7 +526,7 @@ graph LR
     style impact_cloud fill:#7c3aed,stroke:#6d28d9,color:#fff
 ```
 
-This is the slide in a pen test report. The thing a CISO forwards to their VP of Engineering.
+Designed for pen test reports and executive briefings — the diagram a CISO forwards to engineering leadership.
 
 ---
 
@@ -595,6 +607,8 @@ jobs:
 
 **Fine-grained PAT:** Repository Read + Organization Read permissions.
 
+These scopes are required to read repository configuration, workflow files, environment rules, and organization settings. GhostGates performs read-only analysis — it never writes to your repos.
+
 **Token safety:** Tokens are never logged, stored in the database, or included in error messages. All error paths scrub token patterns before raising.
 
 ---
@@ -635,7 +649,7 @@ jobs:
 | GHOST-WF-007 | `contents:write` without environment gate (repo takeover) | HIGH | repo-write |
 | GHOST-WF-008 | Package/release publish without environment gate | HIGH | repo-write |
 
-> **On supply chain rules (WF-005 through WF-008):** These four rules were added after the March 2026 Trivy supply chain attack, where a stolen PAT was used to delete releases, overwrite the repo, and publish a malicious VS Code extension. The same campaign hit Microsoft, DataDog, and CNCF repos. WF-005 catches the unpinned action vector. WF-006 catches the stolen PAT + dispatch vector. WF-007 catches the contents:write blast radius amplifier. WF-008 catches the malicious publish vector.
+> **On supply chain rules (WF-005 through WF-008):** These four rules were added after the [March 2026 Trivy supply chain incident](https://github.com/aquasecurity/trivy/issues/10265), where a stolen PAT was used to delete releases, overwrite the repo, and publish a malicious VS Code extension. The same campaign targeted Microsoft, DataDog, and CNCF repos. WF-005 catches the unpinned action vector. WF-006 catches the stolen PAT + dispatch vector. WF-007 catches the contents:write blast radius amplifier. WF-008 catches the malicious publish vector.
 
 ### OIDC (2 rules)
 
@@ -750,7 +764,7 @@ Then import the module in `ghostgates/engine/__init__.py` and it auto-registers.
 
 Gato exploits. GitOops maps. GhostGates audits. They solve different problems.
 
-Among the few open-source tools that analyze branch protections, environments, workflows, OIDC, and rulesets together as a single structural security model.
+One of the few open-source tools that analyzes branch protections, environments, workflows, OIDC, and rulesets together as a single structural security model.
 
 ---
 
