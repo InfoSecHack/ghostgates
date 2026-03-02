@@ -1,6 +1,12 @@
 # GhostGates
 
-CI/CD gate bypass analysis engine. Maps the gap between configured security gates and actual enforceability across GitHub Actions workflows, branch protections, environments, and OIDC.
+![License](https://img.shields.io/badge/license-MIT-blue)
+![Python](https://img.shields.io/badge/python-3.11%2B-blue)
+![Status](https://img.shields.io/badge/status-beta-orange)
+
+GhostGates is a CI/CD gate bypass analysis engine that identifies security controls that appear enforced but are structurally bypassable across GitHub Actions workflows, branch protections, environments, rulesets, and OIDC trust configurations.
+
+![GhostGates scan example](docs/screenshot.png)
 
 ## What It Does
 
