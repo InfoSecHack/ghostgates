@@ -65,6 +65,8 @@ def main() -> int:
         return asyncio.run(_cmd_audit(args))
     elif args.command == "recon":
         return _cmd_recon(args)
+    elif args.command == "graph":
+        return _cmd_graph(args)
     else:
         parser.print_help()
         return 1
@@ -228,6 +230,18 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["terminal", "json", "md"],
     )
     recon_p.add_argument("-o", "--output", default=None, help="Write output to file")
+
+    # --- graph ---
+    graph_p = subs.add_parser("graph", help="Kill chain visualization — Mermaid attack path diagrams")
+    graph_p.add_argument("--org", required=True)
+    graph_p.add_argument("--db", default="ghostgates.db")
+    graph_p.add_argument(
+        "--format",
+        default="terminal",
+        choices=["terminal", "json", "mermaid"],
+    )
+    graph_p.add_argument("-o", "--output", default=None, help="Write output to file")
+    graph_p.add_argument("--repo", default=None, help="Graph a single repo")
 
     return parser
 
@@ -564,6 +578,44 @@ def _cmd_recon(args) -> int:
         output = format_recon_markdown(recon)
     else:
         output = format_recon_terminal(recon)
+
+    _write_output(output, getattr(args, "output", None))
+    return 0
+
+
+def _cmd_graph(args) -> int:
+    """Kill chain visualization — Mermaid attack path diagrams."""
+    from ghostgates.storage import SQLiteStore
+    from ghostgates.reporting.graph import (
+        build_org_graph,
+        format_graph_terminal,
+        format_graph_json,
+        format_graph_mermaid,
+    )
+
+    store = SQLiteStore(args.db)
+    result = store.get_latest_scan(args.org)
+    store.close()
+
+    if result is None:
+        print(f"No scan results found for org '{args.org}'.", file=sys.stderr)
+        return 1
+
+    findings = result.findings
+    if args.repo:
+        findings = [f for f in findings if f.repo.endswith(f"/{args.repo}") or f.repo == args.repo]
+        if not findings:
+            print(f"No findings for repo '{args.repo}'.", file=sys.stderr)
+            return 1
+
+    org_graph = build_org_graph(findings, org=args.org)
+
+    if args.format == "json":
+        output = format_graph_json(org_graph)
+    elif args.format == "mermaid":
+        output = format_graph_mermaid(org_graph)
+    else:
+        output = format_graph_terminal(org_graph)
 
     _write_output(output, getattr(args, "output", None))
     return 0

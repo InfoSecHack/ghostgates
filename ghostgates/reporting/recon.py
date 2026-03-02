@@ -31,6 +31,9 @@ def _match_workflow_execution(f: BypassFinding) -> str | None:
     if f.rule_id == "GHOST-WF-004":
         wf = f.evidence.get("workflow", "?")
         return f"workflow_run secrets leak via {wf.split('/')[-1]}"
+    if f.rule_id == "GHOST-WF-006":
+        wf = f.evidence.get("workflow", "?").split("/")[-1]
+        return f"workflow_dispatch + write perms ({wf})"
     return None
 
 
@@ -46,6 +49,10 @@ def _match_secrets_exposure(f: BypassFinding) -> str | None:
     if f.rule_id == "GHOST-WF-002" and f.evidence.get("scope") == "workflow":
         wf = f.evidence.get("workflow", "?").split("/")[-1]
         return f"write-all GITHUB_TOKEN ({wf})"
+    if f.rule_id == "GHOST-WF-007":
+        wf = f.evidence.get("workflow", "?").split("/")[-1]
+        job = f.evidence.get("job", "?")
+        return f"contents:write no env gate ({wf}#{job})"
     return None
 
 
@@ -128,6 +135,23 @@ def _match_review_bypass(f: BypassFinding) -> str | None:
     if f.rule_id == "GHOST-BP-006":
         rs = f.evidence.get("ruleset", "?")
         return f"ruleset '{rs}' in evaluate mode (not enforced)"
+    return None
+
+
+def _match_supply_chain(f: BypassFinding) -> str | None:
+    """Repos vulnerable to supply chain injection."""
+    if f.rule_id == "GHOST-WF-005":
+        wf = f.evidence.get("workflow", "?").split("/")[-1]
+        count = f.evidence.get("unpinned_count", "?")
+        return f"{count} unpinned third-party actions ({wf})"
+    if f.rule_id == "GHOST-WF-008":
+        wf = f.evidence.get("workflow", "?").split("/")[-1]
+        job = f.evidence.get("job", "?")
+        return f"publish without env gate ({wf}#{job})"
+    if f.rule_id == "GHOST-WF-003":
+        wf = f.evidence.get("workflow", "?").split("/")[-1]
+        if f.evidence.get("is_mutable_ref"):
+            return f"secrets: inherit to mutable ref ({wf})"
     return None
 
 
@@ -217,6 +241,13 @@ _CATEGORIES = [
         "Which repos have circumventable branch protections?",
         AttackerLevel.REPO_WRITE,
         _match_review_bypass,
+    ),
+    (
+        "supply_chain",
+        "Supply Chain Injection",
+        "Which repos are vulnerable to upstream dependency poisoning?",
+        AttackerLevel.EXTERNAL,
+        _match_supply_chain,
     ),
 ]
 

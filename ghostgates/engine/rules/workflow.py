@@ -507,3 +507,532 @@ def wf_004_fork_pr_secrets(gate: GateModel) -> list[BypassFinding]:
                 ))
 
     return findings
+
+
+# ==================================================================
+# GHOST-WF-005: Unpinned action references (mutable tags/branches)
+# ==================================================================
+
+_KNOWN_FIRST_PARTY = frozenset({
+    "actions/checkout",
+    "actions/setup-node",
+    "actions/setup-python",
+    "actions/setup-java",
+    "actions/setup-go",
+    "actions/setup-dotnet",
+    "actions/cache",
+    "actions/upload-artifact",
+    "actions/download-artifact",
+    "actions/github-script",
+    "github/codeql-action",
+})
+
+
+def _is_pinned_ref(uses: str) -> bool:
+    """Check if an action reference is pinned to a SHA."""
+    if "@" not in uses:
+        return False
+    ref = uses.split("@")[-1]
+    # SHA: 40 hex chars
+    return len(ref) == 40 and all(c in "0123456789abcdef" for c in ref)
+
+
+def _is_first_party(uses: str) -> bool:
+    """Check if action is from actions/ or github/ org."""
+    action_path = uses.split("@")[0] if "@" in uses else uses
+    return any(action_path.startswith(fp) for fp in _KNOWN_FIRST_PARTY)
+
+
+@registry.rule(
+    rule_id="GHOST-WF-005",
+    name="Unpinned third-party action reference",
+    gate_type=GateType.WORKFLOW,
+    min_privilege=AttackerLevel.EXTERNAL,
+    tags=("workflow", "supply-chain", "pinning", "actions"),
+)
+def wf_005_unpinned_actions(gate: GateModel) -> list[BypassFinding]:
+    """Detects third-party actions referenced by mutable tag/branch.
+
+    Impact: Tag references (@v3, @main) can be force-pushed by the
+    action maintainer — or an attacker who compromises their repo.
+    This is the exact vector used in the tj-actions/changed-files
+    supply chain attack and the March 2026 campaign that hit Trivy,
+    Microsoft, DataDog, and CNCF repos.
+
+    Only flags third-party actions (not actions/ or github/ org).
+    First-party actions are lower risk because GitHub controls them.
+    """
+    findings: list[BypassFinding] = []
+
+    for wf in gate.workflows:
+        unpinned: list[dict] = []
+
+        for job in wf.jobs:
+            # Reusable workflow ref
+            if job.uses and not _is_pinned_ref(job.uses):
+                unpinned.append({
+                    "job": job.name,
+                    "ref": job.uses,
+                    "type": "reusable_workflow",
+                })
+
+            for step in job.steps:
+                if not step.uses or "actions/checkout" == step.uses.split("@")[0]:
+                    continue
+                if _is_pinned_ref(step.uses):
+                    continue
+                if _is_first_party(step.uses):
+                    continue  # skip actions/ and github/ orgs
+
+                unpinned.append({
+                    "job": job.name,
+                    "ref": step.uses,
+                    "type": "action",
+                    "step": step.name or step.uses,
+                })
+
+        if not unpinned:
+            continue
+
+        # Deduplicate by action reference
+        seen_refs = set()
+        unique_unpinned = []
+        for u in unpinned:
+            if u["ref"] not in seen_refs:
+                seen_refs.add(u["ref"])
+                unique_unpinned.append(u)
+
+        refs_list = "\n".join(
+            f"  - {u['ref']} ({u['type']} in job '{u['job']}')"
+            for u in unique_unpinned[:10]
+        )
+
+        findings.append(BypassFinding(
+            rule_id="GHOST-WF-005",
+            rule_name="Unpinned third-party action reference",
+            repo=gate.full_name,
+            gate_type=GateType.WORKFLOW,
+            severity=Severity.HIGH,
+            confidence=Confidence.HIGH,
+            min_privilege=AttackerLevel.EXTERNAL,
+            summary=(
+                f"Workflow '{wf.name}' ({wf.path}) uses {len(unique_unpinned)} "
+                f"unpinned third-party action(s) — vulnerable to supply chain "
+                f"tag poisoning."
+            ),
+            bypass_path=(
+                f"1. Workflow '{wf.path}' references third-party actions by "
+                f"mutable tag or branch\n"
+                f"2. Unpinned references:\n{refs_list}\n"
+                f"3. Attacker compromises one action's repo\n"
+                f"4. Attacker force-pushes the tag to inject malicious code\n"
+                f"5. Next workflow run executes attacker's code with "
+                f"GITHUB_TOKEN permissions"
+            ),
+            evidence={
+                "workflow": wf.path,
+                "unpinned_count": len(unique_unpinned),
+                "unpinned_refs": [u["ref"] for u in unique_unpinned[:10]],
+            },
+            gating_conditions=[
+                "Attacker must compromise a referenced action's repository",
+                "Workflow must be triggerable (push, PR, schedule, etc.)",
+            ],
+            remediation=(
+                f"Pin all third-party actions to full commit SHAs:\n"
+                f"  # Before (vulnerable):\n"
+                f"  uses: some-org/action@v3\n"
+                f"  # After (pinned):\n"
+                f"  uses: some-org/action@abc123...  # v3\n"
+                f"Use tools like 'pinact' or Dependabot to automate SHA pinning.\n"
+                f"→ {workflow_file_url(gate.full_name, wf.path)}"
+            ),
+            settings_url=workflow_file_url(gate.full_name, wf.path),
+            references=[
+                "https://www.stepsecurity.io/blog/harden-runner-detection-tj-actions-changed-files-attack",
+            ],
+        ))
+
+    return findings
+
+
+# ==================================================================
+# GHOST-WF-006: workflow_dispatch with elevated permissions
+# ==================================================================
+
+@registry.rule(
+    rule_id="GHOST-WF-006",
+    name="workflow_dispatch with write permissions",
+    gate_type=GateType.WORKFLOW,
+    min_privilege=AttackerLevel.REPO_WRITE,
+    tags=("workflow", "dispatch", "remote-trigger", "supply-chain"),
+)
+def wf_006_dispatch_write(gate: GateModel) -> list[BypassFinding]:
+    """Detects workflow_dispatch workflows with write permissions.
+
+    Impact: workflow_dispatch can be triggered remotely via API with
+    any PAT that has repo scope. If the workflow has write permissions
+    (explicit or inherited), a stolen PAT becomes a remote code
+    execution vector — the attacker can trigger the workflow and it
+    runs with write access to contents, packages, and more.
+
+    This is the attack pattern used against Trivy: stolen PAT +
+    workflow with elevated permissions = repo takeover.
+    """
+    findings: list[BypassFinding] = []
+    default_is_write = (
+        gate.workflow_permissions.default_workflow_permissions == "write"
+    )
+
+    for wf in gate.workflows:
+        has_dispatch = any(
+            t.event == "workflow_dispatch" for t in wf.triggers
+        )
+        if not has_dispatch:
+            continue
+
+        # Check if workflow has write permissions (explicit or inherited)
+        wf_has_write = _is_write_all(wf.permissions)
+        inherits_write = (not wf.permissions and default_is_write)
+
+        if not wf_has_write and not inherits_write:
+            # Check per-job for specific dangerous permissions
+            dangerous_jobs = []
+            for job in wf.jobs:
+                if _is_write_all(job.permissions):
+                    dangerous_jobs.append(job.name)
+                elif _has_dangerous_permissions(job.permissions):
+                    dangerous_jobs.append(job.name)
+            if not dangerous_jobs:
+                continue
+
+            findings.append(BypassFinding(
+                rule_id="GHOST-WF-006",
+                rule_name="workflow_dispatch with write permissions",
+                repo=gate.full_name,
+                gate_type=GateType.WORKFLOW,
+                severity=Severity.HIGH,
+                confidence=Confidence.HIGH,
+                min_privilege=AttackerLevel.REPO_WRITE,
+                summary=(
+                    f"Workflow '{wf.name}' ({wf.path}) is remotely triggerable "
+                    f"via workflow_dispatch with write permissions on jobs: "
+                    f"{', '.join(dangerous_jobs)}."
+                ),
+                bypass_path=(
+                    f"1. Workflow '{wf.path}' triggers on workflow_dispatch\n"
+                    f"2. Jobs with write permissions: {', '.join(dangerous_jobs)}\n"
+                    f"3. Attacker with stolen PAT (repo scope) calls:\n"
+                    f"   POST /repos/{gate.full_name}/actions/workflows/"
+                    f"{wf.path.split('/')[-1]}/dispatches\n"
+                    f"4. Workflow executes with elevated GITHUB_TOKEN permissions\n"
+                    f"5. Attacker can modify contents, packages, or releases"
+                ),
+                evidence={
+                    "workflow": wf.path,
+                    "trigger": "workflow_dispatch",
+                    "dangerous_jobs": dangerous_jobs,
+                },
+                gating_conditions=[
+                    "Attacker needs a PAT with repo scope or write access",
+                ],
+                remediation=(
+                    f"Restrict permissions on workflow_dispatch workflows to "
+                    f"read-only at the workflow level, then grant specific write "
+                    f"scopes only to jobs that need them behind environment gates.\n"
+                    f"→ {workflow_file_url(gate.full_name, wf.path)}"
+                ),
+                settings_url=workflow_file_url(gate.full_name, wf.path),
+            ))
+            continue
+
+        perm_source = "explicit write-all" if wf_has_write else "inherited from org/repo default"
+
+        findings.append(BypassFinding(
+            rule_id="GHOST-WF-006",
+            rule_name="workflow_dispatch with write permissions",
+            repo=gate.full_name,
+            gate_type=GateType.WORKFLOW,
+            severity=Severity.HIGH,
+            confidence=Confidence.HIGH,
+            min_privilege=AttackerLevel.REPO_WRITE,
+            summary=(
+                f"Workflow '{wf.name}' ({wf.path}) is remotely triggerable "
+                f"via workflow_dispatch with {perm_source} — stolen PAT = "
+                f"remote code execution."
+            ),
+            bypass_path=(
+                f"1. Workflow '{wf.path}' triggers on workflow_dispatch\n"
+                f"2. Permissions: {perm_source}\n"
+                f"3. Attacker with stolen PAT (repo scope) calls:\n"
+                f"   POST /repos/{gate.full_name}/actions/workflows/"
+                f"{wf.path.split('/')[-1]}/dispatches\n"
+                f"4. Workflow executes with write-all GITHUB_TOKEN\n"
+                f"5. Attacker can push code, delete releases, modify packages"
+            ),
+            evidence={
+                "workflow": wf.path,
+                "trigger": "workflow_dispatch",
+                "permissions_source": perm_source,
+                "workflow_permissions": wf.permissions or "inherited",
+            },
+            gating_conditions=[
+                "Attacker needs a PAT with repo scope or write access",
+            ],
+            remediation=(
+                f"Add explicit least-privilege permissions to '{wf.path}':\n"
+                f"  permissions:\n"
+                f"    contents: read\n"
+                f"If write access is needed, gate it behind a protected environment "
+                f"with required reviewers.\n"
+                f"→ {workflow_file_url(gate.full_name, wf.path)}"
+            ),
+            settings_url=workflow_file_url(gate.full_name, wf.path),
+        ))
+
+    return findings
+
+
+def _has_dangerous_permissions(perms: dict) -> bool:
+    """Check if permissions dict includes write access to dangerous scopes."""
+    dangerous_scopes = {"contents", "packages", "actions", "deployments"}
+    for scope in dangerous_scopes:
+        if perms.get(scope) == "write":
+            return True
+    return False
+
+
+# ==================================================================
+# GHOST-WF-007: contents:write without environment gate
+# ==================================================================
+
+@registry.rule(
+    rule_id="GHOST-WF-007",
+    name="contents:write without environment gate",
+    gate_type=GateType.WORKFLOW,
+    min_privilege=AttackerLevel.REPO_WRITE,
+    tags=("workflow", "permissions", "contents", "release", "supply-chain"),
+)
+def wf_007_contents_write_no_env(gate: GateModel) -> list[BypassFinding]:
+    """Detects workflows with contents:write that lack environment gates.
+
+    Impact: contents:write allows pushing commits, creating/deleting
+    releases, creating/deleting tags, and modifying repo contents.
+    Without an environment gate (required reviewers), any workflow
+    trigger can execute these destructive actions.
+
+    In the Trivy attack, contents:write enabled the attacker to delete
+    releases, rename the repo, and overwrite it with empty content.
+    An environment gate would have required human approval.
+    """
+    findings: list[BypassFinding] = []
+    default_is_write = (
+        gate.workflow_permissions.default_workflow_permissions == "write"
+    )
+
+    for wf in gate.workflows:
+        for job in wf.jobs:
+            has_env = bool(job.environment)
+            has_contents_write = False
+            perm_source = ""
+
+            # Explicit job permissions
+            if job.permissions.get("contents") == "write":
+                has_contents_write = True
+                perm_source = "explicit job-level contents: write"
+            elif _is_write_all(job.permissions):
+                has_contents_write = True
+                perm_source = "job-level write-all"
+            # Inherit from workflow level
+            elif not job.permissions:
+                if wf.permissions.get("contents") == "write":
+                    has_contents_write = True
+                    perm_source = "workflow-level contents: write"
+                elif _is_write_all(wf.permissions):
+                    has_contents_write = True
+                    perm_source = "workflow-level write-all"
+                elif not wf.permissions and default_is_write:
+                    has_contents_write = True
+                    perm_source = "inherited from org/repo default (write)"
+
+            if not has_contents_write or has_env:
+                continue
+
+            findings.append(BypassFinding(
+                rule_id="GHOST-WF-007",
+                rule_name="contents:write without environment gate",
+                repo=gate.full_name,
+                gate_type=GateType.WORKFLOW,
+                severity=Severity.HIGH,
+                confidence=Confidence.HIGH,
+                min_privilege=AttackerLevel.REPO_WRITE,
+                summary=(
+                    f"Job '{job.name}' in '{wf.path}' has contents:write "
+                    f"({perm_source}) without an environment gate — can "
+                    f"push commits, delete releases, modify tags."
+                ),
+                bypass_path=(
+                    f"1. Workflow '{wf.path}' job '{job.name}'\n"
+                    f"2. Has {perm_source}\n"
+                    f"3. No environment gate (no required reviewers)\n"
+                    f"4. GITHUB_TOKEN can: push commits, create/delete releases, "
+                    f"create/delete tags, modify repo contents\n"
+                    f"5. If triggered by attacker (dispatch, compromised PR, "
+                    f"stolen PAT), all destructive actions execute without approval"
+                ),
+                evidence={
+                    "workflow": wf.path,
+                    "job": job.name,
+                    "permissions_source": perm_source,
+                    "environment": None,
+                },
+                gating_conditions=[
+                    "Attacker must be able to trigger the workflow",
+                ],
+                remediation=(
+                    f"Add a protected environment with required reviewers to "
+                    f"job '{job.name}' in '{wf.path}':\n"
+                    f"  jobs:\n"
+                    f"    {job.name}:\n"
+                    f"      environment: production\n"
+                    f"      permissions:\n"
+                    f"        contents: write\n"
+                    f"This ensures human approval before destructive actions.\n"
+                    f"→ {workflow_file_url(gate.full_name, wf.path)}"
+                ),
+                settings_url=workflow_file_url(gate.full_name, wf.path),
+            ))
+
+    return findings
+
+
+# ==================================================================
+# GHOST-WF-008: Package/release publish without environment gate
+# ==================================================================
+
+_PUBLISH_ACTIONS = frozenset({
+    "actions/create-release",
+    "softprops/action-gh-release",
+    "ncipollo/release-action",
+    "pypa/gh-action-pypi-publish",
+    "JS-DevTools/npm-publish",
+    "docker/build-push-action",
+    "docker/login-action",
+    "aws-actions/amazon-ecr-login",
+    "google-github-actions/setup-gcloud",
+})
+
+_PUBLISH_COMMANDS = (
+    "npm publish",
+    "yarn publish",
+    "twine upload",
+    "pip upload",
+    "docker push",
+    "gh release create",
+    "gh release upload",
+    "dotnet nuget push",
+    "cargo publish",
+    "gem push",
+    "vsce publish",
+    "ovsx publish",
+)
+
+
+@registry.rule(
+    rule_id="GHOST-WF-008",
+    name="Package/release publish without environment gate",
+    gate_type=GateType.WORKFLOW,
+    min_privilege=AttackerLevel.REPO_WRITE,
+    tags=("workflow", "publish", "supply-chain", "registry"),
+)
+def wf_008_publish_no_env(gate: GateModel) -> list[BypassFinding]:
+    """Detects workflows that publish to package registries without
+    environment gates.
+
+    Impact: Publishing to npm, PyPI, Docker Hub, VSIX, NuGet, or
+    creating GitHub releases without required reviewers means any
+    workflow trigger can push malicious artifacts. In the Trivy attack,
+    the attacker published a malicious VS Code extension to Open VSIX.
+
+    An environment gate with required reviewers would have blocked
+    the malicious publish.
+    """
+    findings: list[BypassFinding] = []
+
+    for wf in gate.workflows:
+        for job in wf.jobs:
+            has_env = bool(job.environment)
+            if has_env:
+                continue
+
+            publish_evidence = _detect_publish_steps(job)
+            if not publish_evidence:
+                continue
+
+            findings.append(BypassFinding(
+                rule_id="GHOST-WF-008",
+                rule_name="Package/release publish without environment gate",
+                repo=gate.full_name,
+                gate_type=GateType.WORKFLOW,
+                severity=Severity.HIGH,
+                confidence=Confidence.HIGH,
+                min_privilege=AttackerLevel.REPO_WRITE,
+                summary=(
+                    f"Job '{job.name}' in '{wf.path}' publishes to a package "
+                    f"registry or creates releases without an environment gate."
+                ),
+                bypass_path=(
+                    f"1. Workflow '{wf.path}' job '{job.name}'\n"
+                    f"2. Publish actions detected:\n"
+                    + "\n".join(
+                        f"   - {p}" for p in publish_evidence[:5]
+                    )
+                    + f"\n3. No environment gate (no required reviewers)\n"
+                    f"4. Attacker who triggers workflow can publish malicious "
+                    f"artifacts to downstream consumers"
+                ),
+                evidence={
+                    "workflow": wf.path,
+                    "job": job.name,
+                    "publish_steps": publish_evidence[:5],
+                    "environment": None,
+                },
+                gating_conditions=[
+                    "Attacker must be able to trigger the workflow",
+                    "Publish credentials (secrets) must be available to the job",
+                ],
+                remediation=(
+                    f"Add a protected environment with required reviewers to "
+                    f"the publish job:\n"
+                    f"  jobs:\n"
+                    f"    {job.name}:\n"
+                    f"      environment: release\n"
+                    f"This ensures human review before any package is published.\n"
+                    f"→ {workflow_file_url(gate.full_name, wf.path)}"
+                ),
+                settings_url=workflow_file_url(gate.full_name, wf.path),
+            ))
+
+    return findings
+
+
+def _detect_publish_steps(job: WorkflowJob) -> list[str]:
+    """Detect steps that publish to registries or create releases."""
+    evidence: list[str] = []
+
+    for step in job.steps:
+        # Check action references
+        if step.uses:
+            action_name = step.uses.split("@")[0]
+            if action_name in _PUBLISH_ACTIONS:
+                evidence.append(f"uses: {step.uses}")
+
+        # Check run commands
+        if step.run:
+            run_lower = step.run.lower()
+            for cmd in _PUBLISH_COMMANDS:
+                if cmd in run_lower:
+                    evidence.append(f"run: {cmd}")
+                    break  # one match per step
+
+    return evidence
