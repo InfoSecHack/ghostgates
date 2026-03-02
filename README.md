@@ -8,18 +8,6 @@ GhostGates is a CI/CD gate bypass analysis engine that identifies security contr
 
 ![GhostGates scan example](docs/screenshot.png)
 
-## Quick Start
-
-```bash
-git clone https://github.com/InfoSecHack/ghostgates
-cd ghostgates
-
-pip install -e ".[dev]"
-
-export GITHUB_TOKEN=ghp_your_token_here
-
-ghostgates scan --org my-org
-
 ## What It Does
 
 Organizations configure security "gates" in GitHub — required reviews, environment approvals, branch protections, OIDC claims. GhostGates systematically identifies when those gates are **structurally bypassable**, meaning an attacker at a given privilege level can circumvent them without breaking any technical controls.
