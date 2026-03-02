@@ -85,6 +85,7 @@ def env_001_no_reviewers(gate: GateModel) -> list[BypassFinding]:
                 f"for production-tier environments.\n"
                 f"→ {environment_url(gate.full_name)}"
             ),
+            settings_url=environment_url(gate.full_name),
             references=[
                 "https://docs.github.com/en/actions/deployment/targeting-different-environments/using-environments-for-deployment",
             ],
@@ -166,6 +167,7 @@ def env_002_any_branch_deploy(gate: GateModel) -> list[BypassFinding]:
                 f"to specific branches.\n"
                 f"→ {environment_url(gate.full_name)}"
             ),
+            settings_url=environment_url(gate.full_name),
         ))
 
     return findings
@@ -236,6 +238,7 @@ def env_003_wait_timer_only(gate: GateModel) -> list[BypassFinding]:
                 f"should not be the sole protection mechanism.\n"
                 f"→ {environment_url(gate.full_name)}"
             ),
+            settings_url=environment_url(gate.full_name),
         ))
 
     return findings

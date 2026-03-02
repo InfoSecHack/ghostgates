@@ -30,6 +30,7 @@ class BypassFinding(BaseModel):
     remediation: str                                # specific fix
     references: list[str] = Field(default_factory=list)
     instance: str = ""                              # unique instance key within a rule
+    settings_url: str = ""                          # direct link to GitHub settings page for fix
 
     def model_post_init(self, __context) -> None:
         """Auto-derive instance key from evidence if not explicitly set."""

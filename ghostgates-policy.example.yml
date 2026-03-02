@@ -1,0 +1,46 @@
+# ghostgates-policy.yml
+#
+# Define your organization's CI/CD security standard.
+# Only checks that are explicitly set are enforced.
+# Run: ghostgates audit --org my-org --policy ghostgates-policy.yml
+
+policy:
+  # Branch protection requirements (checked on default branch)
+  branch_protection:
+    enforce_admins: true
+    dismiss_stale_reviews: true
+    min_reviewers: 2
+    require_codeowners: true
+    require_status_checks: true
+    block_force_pushes: true
+
+  # Environment requirements (keys are regex patterns matching env names)
+  environments:
+    "prod.*":
+      required_reviewers: true
+      restrict_branches: true
+      min_wait_timer: 5
+    "staging":
+      required_reviewers: true
+
+  # Workflow-level requirements
+  workflows:
+    max_default_permissions: read
+    block_pull_request_target: true
+    block_secrets_inherit: true
+    block_write_all: true
+    block_pr_approval: true
+
+  # OIDC requirements
+  oidc:
+    require_custom_template: true
+    require_environment_claim: true
+
+# Which repos this policy applies to (regex on repo name, not full_name)
+scope:
+  include:
+    - ".*"                    # all repos
+  exclude:
+    - "docs"                  # skip docs repo
+    - ".*-sandbox"            # skip sandbox repos
+    - ".*-test"               # skip test repos

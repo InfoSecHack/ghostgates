@@ -78,6 +78,7 @@ def bp_001_admin_bypass_reviews(gate: GateModel) -> list[BypassFinding]:
                     f"requirements as other contributors.\n"
                     f"→ {branches_url(gate.full_name)}"
                 ),
+                settings_url=branches_url(gate.full_name),
                 references=[
                     "https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-a-branch-protection-rule/managing-a-branch-protection-rule",
                 ],
@@ -144,6 +145,7 @@ def bp_002_stale_reviews(gate: GateModel) -> list[BypassFinding]:
                     f"on branch protection for '{bp.branch}'.\n"
                     f"→ {branches_url(gate.full_name)}"
                 ),
+                settings_url=branches_url(gate.full_name),
                 references=[
                     "https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-a-branch-protection-rule/managing-a-branch-protection-rule",
                 ],
@@ -214,6 +216,7 @@ def bp_003_no_codeowners(gate: GateModel) -> list[BypassFinding]:
                     f"CODEOWNERS must be approved by the designated owners.\n"
                     f"→ {branches_url(gate.full_name)}"
                 ),
+                settings_url=branches_url(gate.full_name),
             ))
 
     return findings
@@ -303,6 +306,7 @@ def bp_004_unprotected_deploy_branches(gate: GateModel) -> list[BypassFinding]:
                 f"reviews as the default branch.\n"
                 f"→ {branches_url(gate.full_name)}"
             ),
+            settings_url=branches_url(gate.full_name),
         ))
 
     return findings
@@ -425,6 +429,7 @@ def bp_005_workflow_self_approve(gate: GateModel) -> list[BypassFinding]:
             "needed for specific bots, use a dedicated GitHub App with scoped permissions.\n"
             f"→ {actions_url(gate.full_name)}"
         ),
+        settings_url=actions_url(gate.full_name),
         references=[
             "https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository#preventing-github-actions-from-creating-or-approving-pull-requests",
         ],
@@ -513,6 +518,7 @@ def bp_006_evaluate_mode_ruleset(gate: GateModel) -> list[BypassFinding]:
                 f"rules are also in place as a backstop.\n"
                 f"→ {rulesets_url(gate.full_name)}"
             ),
+            settings_url=rulesets_url(gate.full_name),
             references=[
                 "https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/managing-rulesets-for-a-repository",
             ],

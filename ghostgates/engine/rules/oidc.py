@@ -99,6 +99,7 @@ def oidc_001_default_subject(gate: GateModel) -> list[BypassFinding]:
                 "can assume specific cloud roles.\n"
                 f"→ {oidc_org_url(gate.org)}"
             ),
+            settings_url=oidc_org_url(gate.org),
             references=[
                 "https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/about-security-hardening-with-openid-connect#customizing-the-subject-claims",
             ],
@@ -141,6 +142,7 @@ def oidc_001_default_subject(gate: GateModel) -> list[BypassFinding]:
                     "Then update cloud trust policies to check the environment claim.\n"
                     f"→ {oidc_org_url(gate.org)}"
                 ),
+                settings_url=oidc_org_url(gate.org),
             ))
 
     return findings
@@ -232,6 +234,7 @@ def oidc_002_no_environment_gate(gate: GateModel) -> list[BypassFinding]:
                     f"→ {workflow_file_url(gate.full_name, wf.path)}\n"
                     f"→ {environment_url(gate.full_name)}"
                 ),
+                settings_url=workflow_file_url(gate.full_name, wf.path),
             ))
 
     return findings

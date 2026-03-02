@@ -111,6 +111,7 @@ def wf_001_pr_target_checkout(gate: GateModel) -> list[BypassFinding]:
                     f"(no npm install, no make, no arbitrary scripts) after checkout.\n"
                     f"→ {workflow_file_url(gate.full_name, wf.path)}"
                 ),
+                settings_url=workflow_file_url(gate.full_name, wf.path),
                 references=[
                     "https://securitylab.github.com/research/github-actions-preventing-pwn-requests/",
                 ],
@@ -249,6 +250,7 @@ def wf_002_write_all_permissions(gate: GateModel) -> list[BypassFinding]:
                         f"→ {workflow_file_url(gate.full_name, wf.path)}\n"
                         f"→ {actions_url(gate.full_name)}"
                     ),
+                    settings_url=workflow_file_url(gate.full_name, wf.path),
                 ))
 
     return findings
@@ -302,6 +304,7 @@ def _make_wf002_finding(
             f"    pull-requests: read\n"
             f"→ {workflow_file_url(gate.full_name, wf.path)}"
         ),
+        settings_url=workflow_file_url(gate.full_name, wf.path),
     )
 
 
@@ -389,6 +392,7 @@ def wf_003_secrets_inherit(gate: GateModel) -> list[BypassFinding]:
                     f"Also pin the reusable workflow to a SHA instead of a branch.\n"
                     f"→ {workflow_file_url(gate.full_name, wf.path)}"
                 ),
+                settings_url=workflow_file_url(gate.full_name, wf.path),
             ))
 
     return findings
@@ -496,6 +500,7 @@ def wf_004_fork_pr_secrets(gate: GateModel) -> list[BypassFinding]:
                         f"only running trusted code.\n"
                         f"→ {workflow_file_url(gate.full_name, wf.path)}"
                     ),
+                    settings_url=workflow_file_url(gate.full_name, wf.path),
                     references=[
                         "https://securitylab.github.com/research/github-actions-preventing-pwn-requests/",
                     ],
