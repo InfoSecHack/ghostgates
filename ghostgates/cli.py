@@ -63,6 +63,8 @@ def main() -> int:
         return _cmd_rank(args)
     elif args.command == "audit":
         return asyncio.run(_cmd_audit(args))
+    elif args.command == "recon":
+        return _cmd_recon(args)
     else:
         parser.print_help()
         return 1
@@ -215,6 +217,17 @@ def _build_parser() -> argparse.ArgumentParser:
     audit_p.add_argument("-o", "--output", default=None, help="Write output to file")
     audit_p.add_argument("--offline", action="store_true",
                          help="Use stored gate models (no API calls)")
+
+    # --- recon ---
+    recon_p = subs.add_parser("recon", help="Attack surface view — findings grouped by offensive question")
+    recon_p.add_argument("--org", required=True)
+    recon_p.add_argument("--db", default="ghostgates.db")
+    recon_p.add_argument(
+        "--format",
+        default="terminal",
+        choices=["terminal", "json", "md"],
+    )
+    recon_p.add_argument("-o", "--output", default=None, help="Write output to file")
 
     return parser
 
@@ -523,6 +536,37 @@ async def _cmd_audit(args) -> int:
 
     # Exit code: 0 if fully compliant, 1 if gaps found
     return 0 if result.noncompliant_count == 0 else 1
+
+
+def _cmd_recon(args) -> int:
+    """Attack surface view — findings grouped by offensive question."""
+    from ghostgates.storage import SQLiteStore
+    from ghostgates.reporting.recon import (
+        build_recon,
+        format_recon_terminal,
+        format_recon_json,
+        format_recon_markdown,
+    )
+
+    store = SQLiteStore(args.db)
+    result = store.get_latest_scan(args.org)
+    store.close()
+
+    if result is None:
+        print(f"No scan results found for org '{args.org}'.", file=sys.stderr)
+        return 1
+
+    recon = build_recon(result.findings, org=args.org)
+
+    if args.format == "json":
+        output = format_recon_json(recon)
+    elif args.format == "md":
+        output = format_recon_markdown(recon)
+    else:
+        output = format_recon_terminal(recon)
+
+    _write_output(output, getattr(args, "output", None))
+    return 0
 
 
 # ------------------------------------------------------------------

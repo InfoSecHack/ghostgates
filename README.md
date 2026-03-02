@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
-![Tests](https://img.shields.io/badge/tests-418-green)
+![Tests](https://img.shields.io/badge/tests-450-green)
 ![Status](https://img.shields.io/badge/status-beta-orange)
 
 GhostGates is a CI/CD security analysis tool that identifies **structural bypass paths** in GitHub Actions workflows, branch protections, environments, rulesets, and OIDC trust policies.
@@ -25,6 +25,7 @@ Traditional CI/CD scanners detect **misconfigurations**. GhostGates models **how
 - [Usage](#usage)
 - [Risk Ranking](#risk-ranking)
 - [Policy Audit](#policy-audit)
+- [Recon (Attack Surface)](#recon-attack-surface)
 - [Output Formats](#output-formats)
 - [GitHub Action](#github-action)
 - [Token Permissions](#token-permissions)
@@ -392,13 +393,78 @@ scope:
 
 ### Three Views, Same Data
 
-GhostGates gives security teams three complementary perspectives from a single scan:
+GhostGates gives security teams four complementary perspectives from a single scan:
 
 | Command | Perspective | Audience |
 |---------|-------------|----------|
-| `ghostgates scan` | What's exploitable and how | Red team, AppSec |
+| `ghostgates scan` | What's exploitable and how | Security engineering, AppSec |
 | `ghostgates rank` | Where to fix first | Security engineering, triage |
 | `ghostgates audit` | Are we meeting our standard | CISO, compliance, auditors |
+| `ghostgates recon` | What's my attack surface | Red team, pen test |
+
+---
+
+## Recon (Attack Surface)
+
+Reshuffles existing findings into offensive attack questions. Same data as `scan`, organized by what a red teamer asks during recon instead of by repo.
+
+```bash
+# Attack surface view from latest scan
+ghostgates recon --org my-org
+
+# JSON for tooling
+ghostgates recon --org my-org --format json
+
+# Markdown for report
+ghostgates recon --org my-org --format md -o recon.md
+```
+
+**Six attack surface categories:**
+
+| Category | Question |
+|----------|----------|
+| Workflow Execution | Which repos allow attacker-controlled code execution in workflows? |
+| Secrets Exposure | Which pipelines expose secrets to untrusted contexts? |
+| Cloud Credential Theft | Which repos allow unauthorized cloud role assumption? |
+| Code to Prod Without Review | Which repos allow code to reach prod without human review? |
+| Production Deployment Paths | Which workflows can deploy to production? |
+| Review Bypass Paths | Which repos have circumventable branch protections? |
+
+Example output:
+
+```
+╔══════════════════════════════════════════════════════╗
+║  GhostGates Attack Surface                           ║
+╚══════════════════════════════════════════════════════╝
+
+  Organization:  my-org
+  Findings:      19
+  Repos exposed: 3
+
+  ── Attacker-Controlled Workflow Execution ──  (requires: NO CREDS)
+  Which repos allow attacker-controlled code execution in workflows?
+
+    my-org/payments-api
+      → PR head checkout in pr_target_unsafe.yml  (GHOST-WF-001)
+
+  ── Secrets Exposure ──  (requires: NO CREDS)
+  Which pipelines expose secrets to untrusted contexts?
+
+    my-org/payments-api
+      → secrets: inherit → deploy.yml (deploy_unsafe.yml)  (GHOST-WF-003)
+      → fork PR secrets via workflow_run (post_ci_deploy.yml)  (GHOST-WF-004)
+
+  ── Cloud Credential Theft (OIDC) ──  (requires: repo-write)
+  Which repos allow unauthorized cloud role assumption?
+
+    my-org/payments-api
+      → id-token: write without env gate (oidc_deploy.yml#deploy-aws)  (GHOST-OIDC-002)
+
+  ── Clean ──
+    ✓ Production Deployment Paths
+```
+
+No new API calls. No new rules. Zero additional scan time.
 
 ---
 
@@ -591,12 +657,13 @@ pytest tests/test_engine_env_wf_oidc.py -v
 pytest tests/test_rank.py -v
 pytest tests/test_sarif.py -v
 pytest tests/test_policy_audit.py -v
+pytest tests/test_recon.py -v
 
 # Run with debug output
 pytest tests/ -v --tb=long -s
 ```
 
-418 tests, ~14K lines of Python.
+450 tests, ~15K lines of Python.
 
 ---
 
@@ -633,7 +700,7 @@ Then import the module in `ghostgates/engine/__init__.py` and it auto-registers.
 | [Gato](https://github.com/praetorian-inc/gato) | Exploits GitHub Actions (self-hosted runners, secret exfil) | Offensive exploitation |
 | [GitOops](https://github.com/ovotech/gitoops) | Maps user→repo→secret graph paths in Neo4j | Graph traversal (archived) |
 | [Actions Attack Diagram](https://github.com/jstawinski/GitHub-Actions-Attack-Diagram) | Reference flowchart of Actions attack paths | Educational diagram |
-| **GhostGates** | Audits structural bypass paths + policy compliance | Defensive analysis |
+| **GhostGates** | Audits structural bypass paths + policy compliance + attack surface | Defensive analysis + red team recon |
 
 Gato exploits. GitOops maps. GhostGates audits. They solve different problems.
 
