@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
 from ghostgates.models.enums import (
     AttackerLevel,
     Confidence,
@@ -108,7 +106,7 @@ class TestBuildRepoGraph:
         g = build_repo_graph("acme/api", findings)
         impacts = [n for n in g.nodes if n.kind == NodeKind.IMPACT]
         assert len(impacts) == 1
-        assert "Unreviewed" in impacts[0].label
+        assert "Potential review-policy" in impacts[0].label
 
     def test_empty_findings_empty_graph(self):
         g = build_repo_graph("acme/api", [])
@@ -192,7 +190,7 @@ class TestBypassLabels:
         assert "aws" in label
 
     def test_bp006_label(self):
-        label = self._get_bypass_label("GHOST-BP-006", {"ruleset": "test-rules"})
+        label = self._get_bypass_label("GHOST-BP-006", {"ruleset_name": "test-rules"})
         assert "test-rules" in label
         assert "evaluate" in label
 
@@ -220,27 +218,21 @@ class TestImpactDerivation:
             "GHOST-WF-001", gate_type=GateType.WORKFLOW,
             evidence={"workflow": ".github/workflows/x.yml"},
         )
-        assert "Code Execution" in label
+        assert "Potential code execution" in label
 
     def test_oidc002_impact(self):
         label = self._get_impact_label(
             "GHOST-OIDC-002", gate_type=GateType.OIDC,
             evidence={"workflow": ".github/workflows/x.yml", "job": "y"},
         )
-        assert "Cloud" in label
+        assert "Potential OIDC token" in label
 
     def test_env001_impact(self):
         label = self._get_impact_label(
             "GHOST-ENV-001", gate_type=GateType.ENVIRONMENT,
             evidence={"environment": "production"},
         )
-        assert "Production" in label
-
-    def test_bp004_impact(self):
-        label = self._get_impact_label(
-            "GHOST-BP-004", evidence={"unprotected_branches": ["staging"]},
-        )
-        assert "Unprotected" in label
+        assert "Deployment environment" in label
 
 
 # ── Org graph ────────────────────────────────────────────────────
@@ -322,7 +314,7 @@ class TestMermaidRenderer:
         ]
         og = build_org_graph(findings, org="acme")
         md = format_graph_mermaid(og)
-        assert "# GhostGates Attack Graph" in md
+        assert "# GhostGates Finding Inference Graph" in md
         assert "```mermaid" in md
         assert "graph LR" in md
         assert "```" in md
@@ -330,7 +322,7 @@ class TestMermaidRenderer:
     def test_empty_org_graph(self):
         og = build_org_graph([], org="acme")
         md = format_graph_mermaid(og)
-        assert "No attack paths" in md
+        assert "No matching findings" in md
 
 
 # ── JSON formatter ───────────────────────────────────────────────
@@ -375,7 +367,7 @@ class TestTerminalFormatter:
         ]
         og = build_org_graph(findings, org="acme")
         output = format_graph_terminal(og)
-        assert "Kill Chain" in output
+        assert "Finding Inference Graph" in output
 
     def test_shows_repo(self):
         findings = [
@@ -400,15 +392,15 @@ class TestTerminalFormatter:
     def test_empty_no_crash(self):
         og = build_org_graph([], org="acme")
         output = format_graph_terminal(og)
-        assert "Kill Chain" in output
-        assert "No attack paths" in output
+        assert "Finding Inference Graph" in output
+        assert "No matching findings" in output
 
 
 # ── Complex scenario ─────────────────────────────────────────────
 
 
 class TestComplexScenario:
-    """Full attack path: external → WF-001 → secrets → OIDC → cloud."""
+    """Mixed findings share prerequisite nodes without implying composition."""
 
     def test_multi_finding_chain(self):
         findings = [
@@ -452,4 +444,4 @@ class TestComplexScenario:
         og = build_org_graph(findings, org="acme")
         assert "```mermaid" in format_graph_mermaid(og)
         assert '"acme"' in format_graph_json(og)
-        assert "Kill Chain" in format_graph_terminal(og)
+        assert "Finding Inference Graph" in format_graph_terminal(og)

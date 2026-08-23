@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
 from ghostgates.models.enums import (
     AttackerLevel,
     Confidence,
@@ -140,7 +138,7 @@ class TestCloudCredCategory:
         recon = build_recon(findings, org="acme")
         cat = next(c for c in recon.categories if c.key == "cloud_creds")
         assert len(cat.hits) == 1
-        assert "cross-repo" in cat.hits[0].description
+        assert "subject template" in cat.hits[0].description
 
     def test_oidc002(self):
         findings = [_finding(
@@ -173,16 +171,6 @@ class TestCodeToProdCategory:
         recon = build_recon(findings, org="acme")
         cat = next(c for c in recon.categories if c.key == "code_to_prod")
         assert len(cat.hits) == 1
-
-    def test_bp004_matches(self):
-        findings = [_finding(
-            rule_id="GHOST-BP-004",
-            evidence={"unprotected_branches": ["staging", "production"]},
-        )]
-        recon = build_recon(findings, org="acme")
-        cat = next(c for c in recon.categories if c.key == "code_to_prod")
-        assert len(cat.hits) == 1
-        assert "staging" in cat.hits[0].description
 
     def test_env001_matches(self):
         findings = [_finding(
@@ -270,7 +258,7 @@ class TestReviewBypassCategory:
     def test_bp006_ruleset(self):
         findings = [_finding(
             rule_id="GHOST-BP-006",
-            evidence={"ruleset": "test-rules"},
+            evidence={"ruleset_name": "test-rules"},
         )]
         recon = build_recon(findings, org="acme")
         cat = next(c for c in recon.categories if c.key == "review_bypass")
@@ -297,10 +285,10 @@ class TestCrossCategoryBehavior:
     def test_empty_findings(self):
         recon = build_recon([], org="acme")
         assert recon.total_findings == 0
-        assert recon.repos_exposed == 0
+        assert recon.repos_represented == 0
         assert all(len(c.hits) == 0 for c in recon.categories)
 
-    def test_repos_exposed_count(self):
+    def test_repos_represented_count(self):
         findings = [
             _finding(rule_id="GHOST-BP-001", repo="acme/api", evidence={"branch": "main"}),
             _finding(rule_id="GHOST-BP-001", repo="acme/web", evidence={"branch": "main"}),
@@ -309,7 +297,7 @@ class TestCrossCategoryBehavior:
                      evidence={"workflow": ".github/workflows/x.yml"}),
         ]
         recon = build_recon(findings, org="acme")
-        assert recon.repos_exposed == 2
+        assert recon.repos_represented == 2
 
     def test_severity_sorting(self):
         """Critical findings should come before high within a category."""
@@ -346,7 +334,7 @@ class TestReconTerminalFormatter:
 
     def test_shows_header(self):
         output = format_recon_terminal(self._recon())
-        assert "Attack Surface" in output
+        assert "Review Questions" in output
 
     def test_shows_categories(self):
         output = format_recon_terminal(self._recon())
@@ -355,12 +343,12 @@ class TestReconTerminalFormatter:
 
     def test_shows_clean_categories(self):
         output = format_recon_terminal(self._recon())
-        assert "Clean" in output
+        assert "not proof of absence" in output
 
     def test_empty_no_crash(self):
         recon = build_recon([], org="test")
         output = format_recon_terminal(recon)
-        assert "Attack Surface" in output
+        assert "Review Questions" in output
 
 
 class TestReconJsonFormatter:
@@ -391,6 +379,6 @@ class TestReconMarkdownFormatter:
         ]
         recon = build_recon(findings, org="acme")
         output = format_recon_markdown(recon)
-        assert "# GhostGates Attack Surface Report" in output
+        assert "# GhostGates Review Questions" in output
         assert "## " in output
         assert "| Repo |" in output

@@ -306,7 +306,7 @@ def _check_workflows(gate: GateModel, policy: GhostGatesPolicy) -> list[PolicyGa
     if wf_policy.block_write_all is not None and wf_policy.block_write_all:
         for wf in gate.workflows:
             # Top-level write-all
-            if wf.permissions.get("__all__") == "write-all":
+            if wf.permissions.get("_shorthand") == "write-all":
                 gaps.append(PolicyGap(
                     repo=gate.full_name,
                     category=GapCategory.WORKFLOW,
@@ -317,7 +317,7 @@ def _check_workflows(gate: GateModel, policy: GhostGatesPolicy) -> list[PolicyGa
                 ))
             # Job-level write-all
             for job in wf.jobs:
-                if job.permissions.get("__all__") == "write-all":
+                if job.permissions.get("_shorthand") == "write-all":
                     gaps.append(PolicyGap(
                         repo=gate.full_name,
                         category=GapCategory.WORKFLOW,
@@ -347,7 +347,7 @@ def _check_oidc(gate: GateModel, policy: GhostGatesPolicy) -> list[PolicyGap]:
 
     if oidc_policy.require_environment_claim is not None and oidc_policy.require_environment_claim:
         template = gate.oidc.org_level_template
-        if template and "environment" not in template:
+        if "environment" not in template:
             gaps.append(PolicyGap(
                 repo=gate.full_name,
                 category=GapCategory.OIDC,

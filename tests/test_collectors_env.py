@@ -218,7 +218,23 @@ def test_parse_env_custom_protection_rule():
     env = _parse_environment(raw)
     assert len(env.custom_rules) == 1
     assert env.custom_rules[0].app_slug == "policy-bot"
-    assert env.custom_rules[0].timeout_minutes == 30  # default
+
+
+@pytest.mark.parametrize("rule", [
+    {"id": 99, "type": "custom"},
+    {"id": 99, "type": "custom", "app": None},
+    {"id": 99, "type": "custom", "app": {}},
+])
+def test_custom_protection_rule_with_unknown_app_is_preserved(rule):
+    env = _parse_environment({
+        "name": "production",
+        "protection_rules": [rule],
+        "deployment_branch_policy": None,
+    })
+
+    assert len(env.custom_rules) == 1
+    assert env.custom_rules[0].id == 99
+    assert env.custom_rules[0].app_slug == "unknown"
 
 
 def test_parse_env_raw_preserved():

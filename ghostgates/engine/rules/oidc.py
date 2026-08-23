@@ -4,9 +4,9 @@ ghostgates/engine/rules/oidc.py
 OIDC subject claim bypass rules (GHOST-OIDC-001 through GHOST-OIDC-002).
 
 GitHub Actions OIDC tokens allow workflows to authenticate to cloud
-providers (AWS, Azure, GCP) without static credentials. But if the
-subject claim is too broad, an attacker who can trigger any workflow
-in the org can assume the cloud role.
+providers without static credentials. GhostGates observes GitHub-side
+configuration only; it does not collect or validate the cloud provider's
+trust policy.
 """
 
 from __future__ import annotations
@@ -29,27 +29,16 @@ from ghostgates.models.findings import BypassFinding
 
 @registry.rule(
     rule_id="GHOST-OIDC-001",
-    name="Default OIDC subject claim allows cross-repo assumption",
+    name="OIDC subject template requires trust-policy review",
     gate_type=GateType.OIDC,
     min_privilege=AttackerLevel.REPO_WRITE,
     tags=("oidc", "cloud-access", "lateral-movement"),
 )
 def oidc_001_default_subject(gate: GateModel) -> list[BypassFinding]:
-    """Detects when OIDC subject claims use the default template or don't
-    include enough specificity to prevent cross-repo/cross-env assumption.
+    """Flag GitHub OIDC subject configuration for paired trust-policy review.
 
-    Impact: GitHub's default OIDC subject claim is:
-      repo:<org>/<repo>:ref:refs/heads/<branch>
-
-    If the cloud provider's trust policy only checks the org (not the
-    specific repo), any repo in the org can assume the role. Even if
-    it checks the repo, the ref claim allows any branch to assume the
-    role unless the policy also checks for a specific environment.
-
-    The fix is to customize the subject template to include:
-      - repo (always)
-      - environment (for deployment roles)
-      - ref (for branch-specific access)
+    A finding is not proof that a cloud role can be assumed. That conclusion
+    requires the external provider's trust policy, which is not collected.
     """
     findings: list[BypassFinding] = []
 
@@ -64,23 +53,23 @@ def oidc_001_default_subject(gate: GateModel) -> list[BypassFinding]:
     if not oidc.org_level_template:
         findings.append(BypassFinding(
             rule_id="GHOST-OIDC-001",
-            rule_name="Default OIDC subject claim allows cross-repo assumption",
+            rule_name="OIDC subject template requires trust-policy review",
             repo=gate.full_name,
             gate_type=GateType.OIDC,
-            severity=Severity.HIGH,
+            severity=Severity.MEDIUM,
             confidence=Confidence.MEDIUM,
             min_privilege=AttackerLevel.REPO_WRITE,
             summary=(
                 f"Repository {gate.full_name} uses OIDC for cloud access "
-                f"but the org has no customized subject claim template — "
-                f"default claim may allow overly broad role assumption."
+                f"and the org uses GitHub's default subject format; the external "
+                f"cloud trust policy was not collected."
             ),
             bypass_path=(
-                f"1. Workflow in {gate.full_name} requests id-token: write\n"
-                f"2. Org has no custom OIDC subject template (using default)\n"
-                f"3. Default subject: repo:{gate.full_name}:ref:refs/heads/<branch>\n"
-                f"4. If cloud trust policy checks only org, any repo can assume the role\n"
-                f"5. If trust policy checks repo but not environment, any branch can assume"
+                f"Observed: a workflow in {gate.full_name} requests id-token: write\n"
+                f"Observed: the org has no custom OIDC subject template\n"
+                f"Unobserved prerequisite: the cloud trust policy accepts a subject "
+                f"broader than intended\n"
+                f"Potential consequence: unintended workflow contexts may receive cloud access"
             ),
             evidence={
                 "org_oidc_template": None,
@@ -109,7 +98,7 @@ def oidc_001_default_subject(gate: GateModel) -> list[BypassFinding]:
         if "environment" not in oidc.org_level_template:
             findings.append(BypassFinding(
                 rule_id="GHOST-OIDC-001",
-                rule_name="Default OIDC subject claim allows cross-repo assumption",
+                rule_name="OIDC subject template requires trust-policy review",
                 repo=gate.full_name,
                 gate_type=GateType.OIDC,
                 severity=Severity.MEDIUM,
@@ -117,14 +106,14 @@ def oidc_001_default_subject(gate: GateModel) -> list[BypassFinding]:
                 min_privilege=AttackerLevel.REPO_WRITE,
                 summary=(
                     f"Repository {gate.full_name} uses OIDC but the org subject "
-                    f"template does not include 'environment' — cloud roles may "
-                    f"be assumable from any environment."
+                    f"template does not include 'environment'; whether this broadens "
+                    f"access depends on the external cloud trust policy."
                 ),
                 bypass_path=(
-                    f"1. Org OIDC template includes: {oidc.org_level_template}\n"
-                    f"2. 'environment' is not in the template\n"
-                    f"3. Workflows without environment gates can assume the same "
-                    f"cloud role as production deployment workflows"
+                    f"Observed template: {oidc.org_level_template}\n"
+                    f"Observed: 'environment' is not included\n"
+                    f"Unobserved prerequisite: a cloud trust policy relies on the "
+                    f"missing environment distinction"
                 ),
                 evidence={
                     "org_oidc_template": oidc.org_level_template,
@@ -160,16 +149,10 @@ def oidc_001_default_subject(gate: GateModel) -> list[BypassFinding]:
     tags=("oidc", "environment", "cloud-access"),
 )
 def oidc_002_no_environment_gate(gate: GateModel) -> list[BypassFinding]:
-    """Detects workflows that request OIDC tokens (id-token: write) but
-    don't run in a protected environment.
+    """Detect OIDC permission without an observed reviewer-gated environment.
 
-    Impact: Without an environment gate, any workflow trigger can obtain
-    an OIDC token and assume the cloud role. If the workflow is triggered
-    by push, pull_request, or workflow_dispatch, an attacker with write
-    access can get cloud credentials without environment approval.
-
-    This is especially dangerous combined with GHOST-OIDC-001 (no
-    environment in the subject claim).
+    Cloud access remains conditional on the external provider accepting the
+    issued token for a role; that trust policy is not collected.
     """
     findings: list[BypassFinding] = []
 
@@ -197,19 +180,20 @@ def oidc_002_no_environment_gate(gate: GateModel) -> list[BypassFinding]:
                 rule_name="OIDC token used without environment gate",
                 repo=gate.full_name,
                 gate_type=GateType.OIDC,
-                severity=Severity.HIGH,
-                confidence=Confidence.HIGH,
+                severity=Severity.MEDIUM,
+                confidence=Confidence.MEDIUM,
                 min_privilege=AttackerLevel.REPO_WRITE,
                 summary=(
                     f"Job '{job.name}' in '{wf.path}' requests OIDC token "
                     f"(id-token: write) but runs without a reviewer-gated environment."
                 ),
                 bypass_path=(
-                    f"1. Workflow '{wf.path}' job '{job.name}' has id-token: write\n"
-                    f"2. Job {'has no environment' if not env_name else f'uses environment {env_name!r} which has no reviewers'}\n"
-                    f"3. Attacker triggers workflow (push, dispatch, etc.)\n"
-                    f"4. Job obtains OIDC token without human approval\n"
-                    f"5. Token can be used to assume cloud provider roles"
+                    f"Observed: workflow '{wf.path}' job '{job.name}' has id-token: write\n"
+                    f"Observed: job {'has no environment' if not env_name else f'uses environment {env_name!r} which has no reviewers'}\n"
+                    f"Inference: an authorized workflow run can request an OIDC token "
+                    f"without reviewer approval\n"
+                    f"Unobserved prerequisite: a cloud provider trust policy accepts "
+                    f"that token for a role"
                 ),
                 evidence={
                     "workflow": wf.path,

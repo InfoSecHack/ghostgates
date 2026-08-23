@@ -7,8 +7,8 @@ from __future__ import annotations
 import pytest
 
 from ghostgates.engine import registry
-from ghostgates.models.enums import AttackerLevel, GateType, Severity
-from ghostgates.models.gates import WorkflowPermissions, OIDCConfig
+from ghostgates.models.enums import AttackerLevel, Confidence, GateType, Severity
+from ghostgates.models.gates import CustomProtectionRule, WorkflowPermissions, OIDCConfig
 
 from tests.mocks.gate_models import (
     make_bp,
@@ -37,7 +37,7 @@ class TestENV001:
         )
         assert len(findings) == 1
         assert findings[0].evidence["environment"] == "production"
-        assert findings[0].severity == Severity.HIGH
+        assert findings[0].severity == Severity.MEDIUM
 
     def test_silent_when_reviewers_present(self):
         gate = make_gate(environments=[
@@ -86,12 +86,31 @@ class TestENV001:
             make_environment("production"),
             make_environment("staging"),
             make_environment("dev"),
+            make_environment("livereload"),
         ])
         findings = registry.run_rules(
             gate, attacker_level=AttackerLevel.REPO_WRITE,
             rule_ids=["GHOST-ENV-001"],
         )
-        assert len(findings) == 2  # production + staging, not dev
+        assert len(findings) == 2
+
+    def test_custom_rule_is_unmodeled_not_treated_as_approval(self):
+        gate = make_gate(environments=[
+            make_environment(
+                "production",
+                custom_rules=[CustomProtectionRule(id=1, app_slug="gate")],
+            ),
+        ])
+        findings = registry.run_rules(
+            gate, attacker_level=AttackerLevel.REPO_WRITE,
+            rule_ids=["GHOST-ENV-001"],
+        )
+
+        assert len(findings) == 1
+        finding = findings[0]
+        assert finding.confidence == Confidence.MEDIUM
+        assert finding.evidence["has_custom_rules"] is True
+        assert "unmodeled" in finding.bypass_path
 
 
 # ==================================================================
@@ -139,9 +158,28 @@ class TestENV002:
         )
         assert len(findings) == 0
 
+    def test_custom_rule_is_unmodeled_not_treated_as_reviewer(self):
+        gate = make_gate(environments=[
+            make_environment(
+                "production",
+                wait_timer=30,
+                custom_rules=[CustomProtectionRule(id=1, app_slug="gate")],
+            ),
+        ])
+        findings = registry.run_rules(
+            gate, attacker_level=AttackerLevel.REPO_WRITE,
+            rule_ids=["GHOST-ENV-003"],
+        )
+
+        assert len(findings) == 1
+        finding = findings[0]
+        assert finding.confidence == Confidence.MEDIUM
+        assert finding.evidence["has_custom_rules"] is True
+        assert "unmodeled" in finding.bypass_path
+
 
 # ==================================================================
-# GHOST-ENV-003: Wait timer as only protection
+# GHOST-ENV-003: Wait timer without required reviewers
 # ==================================================================
 
 class TestENV003:
@@ -188,7 +226,7 @@ class TestENV003:
 class TestWF001:
     def test_fires_on_classic_pwn_request(self):
         """The canonical attack: pr_target + checkout head + run."""
-        gate = make_gate(workflows=[
+        gate = make_gate(visibility="public", workflows=[
             make_workflow(
                 path=".github/workflows/label.yml",
                 name="Auto Label",
@@ -216,7 +254,7 @@ class TestWF001:
 
     def test_fires_with_github_head_ref(self):
         """Alternative ref format."""
-        gate = make_gate(workflows=[
+        gate = make_gate(visibility="public", workflows=[
             make_workflow(
                 triggers=[make_trigger("pull_request_target")],
                 jobs=[make_job(steps=[
@@ -236,7 +274,7 @@ class TestWF001:
 
     def test_silent_when_no_pr_target(self):
         """Regular pull_request trigger is safe."""
-        gate = make_gate(workflows=[
+        gate = make_gate(visibility="public", workflows=[
             make_workflow(
                 triggers=[make_trigger("pull_request")],
                 jobs=[make_job(steps=[
@@ -253,7 +291,7 @@ class TestWF001:
 
     def test_silent_when_checkout_base_only(self):
         """pr_target but checkout without ref (defaults to base) is safe."""
-        gate = make_gate(workflows=[
+        gate = make_gate(visibility="public", workflows=[
             make_workflow(
                 triggers=[make_trigger("pull_request_target")],
                 jobs=[make_job(steps=[
@@ -270,7 +308,7 @@ class TestWF001:
 
     def test_silent_when_no_code_after_checkout(self):
         """Checkout PR head but no execution afterward — no danger."""
-        gate = make_gate(workflows=[
+        gate = make_gate(visibility="public", workflows=[
             make_workflow(
                 triggers=[make_trigger("pull_request_target")],
                 jobs=[make_job(steps=[
@@ -288,9 +326,9 @@ class TestWF001:
         )
         assert len(findings) == 0
 
-    def test_fires_with_action_after_checkout(self):
-        """A uses: action after PR head checkout is also dangerous."""
-        gate = make_gate(workflows=[
+    def test_setup_only_remote_action_after_checkout_is_not_enough(self):
+        """A setup-only remote action does not demonstrate repository execution."""
+        gate = make_gate(visibility="public", workflows=[
             make_workflow(
                 triggers=[make_trigger("pull_request_target")],
                 jobs=[make_job(steps=[
@@ -306,7 +344,117 @@ class TestWF001:
             gate, attacker_level=AttackerLevel.EXTERNAL,
             rule_ids=["GHOST-WF-001"],
         )
+        assert len(findings) == 0
+
+    def test_fires_with_local_action_after_checkout(self):
+        gate = make_gate(visibility="public", workflows=[
+            make_workflow(
+                triggers=[make_trigger("pull_request_target")],
+                jobs=[make_job(steps=[
+                    make_step(
+                        uses="actions/checkout@v4",
+                        with_={"ref": "${{ github.event.pull_request.head.sha }}"},
+                    ),
+                    make_step(uses="./.github/actions/test"),
+                ])],
+            ),
+        ])
+        findings = registry.run_rules(
+            gate,
+            attacker_level=AttackerLevel.EXTERNAL,
+            rule_ids=["GHOST-WF-001"],
+        )
         assert len(findings) == 1
+
+    @pytest.mark.parametrize(
+        ("uses", "with_"),
+        [
+            ("gradle/gradle-build-action@v2", {"arguments": "build"}),
+            ("borales/actions-yarn@v4", {"cmd": "install"}),
+        ],
+    )
+    def test_execution_like_remote_action_input_is_inferred(self, uses, with_):
+        gate = make_gate(visibility="public", workflows=[
+            make_workflow(
+                triggers=[make_trigger("pull_request_target")],
+                jobs=[make_job(steps=[
+                    make_step(
+                        uses="actions/checkout@v4",
+                        with_={"ref": "${{ github.head_ref }}"},
+                    ),
+                    make_step(uses=uses, with_=with_),
+                ])],
+            ),
+        ])
+        findings = registry.run_rules(
+            gate,
+            attacker_level=AttackerLevel.EXTERNAL,
+            rule_ids=["GHOST-WF-001"],
+        )
+
+        assert len(findings) == 1
+        assert findings[0].confidence == Confidence.MEDIUM
+        assert findings[0].evidence["execution_is_certain"] is False
+        assert "may execute" in findings[0].summary
+
+    @pytest.mark.parametrize("ambiguous_first", [True, False])
+    def test_certain_execution_dominates_ambiguous_evidence(self, ambiguous_first):
+        checkout = make_step(
+            uses="actions/checkout@v4",
+            with_={"ref": "${{ github.head_ref }}"},
+        )
+        ambiguous = make_step(
+            uses="gradle/gradle-build-action@v2",
+            with_={"arguments": "build"},
+        )
+        certain = make_step(run="make test")
+        later_steps = (
+            [ambiguous, certain] if ambiguous_first else [certain, ambiguous]
+        )
+        gate = make_gate(visibility="public", workflows=[
+            make_workflow(
+                triggers=[make_trigger("pull_request_target")],
+                jobs=[make_job(steps=[checkout, *later_steps])],
+            ),
+        ])
+
+        findings = registry.run_rules(
+            gate,
+            attacker_level=AttackerLevel.EXTERNAL,
+            rule_ids=["GHOST-WF-001"],
+        )
+
+        assert len(findings) == 1
+        assert findings[0].confidence == Confidence.HIGH
+        assert findings[0].evidence["execution_is_certain"] is True
+
+    def test_list_valued_remote_action_arguments_are_normalized(self):
+        gate = make_gate(visibility="public", workflows=[
+            make_workflow(
+                triggers=[make_trigger("pull_request_target")],
+                jobs=[make_job(steps=[
+                    make_step(
+                        uses="actions/checkout@v4",
+                        with_={"ref": "${{ github.head_ref }}"},
+                    ),
+                    make_step(
+                        uses="gradle/gradle-build-action@v2",
+                        with_={"arguments": ["clean", "build"]},
+                    ),
+                ])],
+            ),
+        ])
+
+        findings = registry.run_rules(
+            gate,
+            attacker_level=AttackerLevel.EXTERNAL,
+            rule_ids=["GHOST-WF-001"],
+        )
+
+        assert len(findings) == 1
+        assert findings[0].confidence == Confidence.MEDIUM
+        assert findings[0].evidence["execution_is_certain"] is False
+
 
 
 # ==================================================================
@@ -412,7 +560,7 @@ class TestWF003:
         assert len(findings) == 1
         assert findings[0].evidence["is_external"] is True
         assert findings[0].evidence["is_mutable_ref"] is True
-        assert findings[0].severity == Severity.HIGH
+        assert findings[0].severity == Severity.MEDIUM
 
     def test_lower_severity_internal_pinned(self):
         """Internal reusable workflow with SHA ref → MEDIUM."""
@@ -453,7 +601,7 @@ class TestWF003:
         )
         assert len(findings) == 0
 
-    def test_semver_tag_is_immutable(self):
+    def test_semver_tag_is_mutable(self):
         gate = make_gate(
             org="test-org",
             workflows=[
@@ -471,7 +619,7 @@ class TestWF003:
             rule_ids=["GHOST-WF-003"],
         )
         assert len(findings) == 1
-        assert findings[0].evidence["is_mutable_ref"] is False
+        assert findings[0].evidence["is_mutable_ref"] is True
 
 
 # ==================================================================
@@ -549,7 +697,7 @@ class TestOIDC001:
             rule_ids=["GHOST-OIDC-001"],
         )
         assert len(findings) == 1
-        assert findings[0].severity == Severity.HIGH
+        assert findings[0].severity == Severity.MEDIUM
 
     def test_fires_template_without_environment(self):
         gate = make_gate(

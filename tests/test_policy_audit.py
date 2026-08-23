@@ -412,7 +412,7 @@ class TestWorkflowAudit:
         gate = _gate(workflows=[
             WorkflowDefinition(
                 path=".github/workflows/ci.yml",
-                permissions={"__all__": "write-all"},
+                permissions={"_shorthand": "write-all"},
             ),
         ])
         result = evaluate_policy([gate], policy)
@@ -425,7 +425,7 @@ class TestWorkflowAudit:
         gate = _gate(workflows=[
             WorkflowDefinition(
                 path=".github/workflows/ci.yml",
-                jobs=[WorkflowJob(name="deploy", permissions={"__all__": "write-all"})],
+                jobs=[WorkflowJob(name="deploy", permissions={"_shorthand": "write-all"})],
             ),
         ])
         result = evaluate_policy([gate], policy)
@@ -470,6 +470,16 @@ class TestOIDCAudit:
         result = evaluate_policy([gate], policy)
         gaps = [g for g in result.repo_results[0].gaps if g.check == "require_environment_claim"]
         assert len(gaps) >= 1
+
+    def test_require_env_claim_missing_from_empty_template(self):
+        policy = GhostGatesPolicy(policy={
+            "oidc": {"require_environment_claim": True},
+        })
+        gate = _gate(oidc=OIDCConfig(org_level_template=[]))
+        result = evaluate_policy([gate], policy)
+        gaps = [g for g in result.repo_results[0].gaps if g.check == "require_environment_claim"]
+        assert len(gaps) == 1
+
 
     def test_oidc_job_without_env_gap(self):
         policy = GhostGatesPolicy(policy={

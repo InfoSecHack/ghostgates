@@ -1,11 +1,9 @@
 """
 ghostgates/reporting/graph.py
 
-Kill chain visualization — Mermaid diagrams showing attack paths
-from entry to impact, with bypassed gates crossed out.
-
-Same findings, visual lens. The terminal output is for the person
-who fixes it. The diagram is for the person who funds fixing it.
+Finding relationship visualization. Each finding is shown with its stated
+attacker prerequisite and a potential consequence. Edges do not demonstrate
+exploitability or compose one finding into another.
 """
 
 from __future__ import annotations
@@ -62,7 +60,7 @@ class OrgGraph:
 # ── Entry point mapping ─────────────────────────────────────────
 
 _ENTRY_LABELS = {
-    AttackerLevel.EXTERNAL: "External Attacker\\n(no credentials)",
+    AttackerLevel.EXTERNAL: "External to target repo\\n(no target access)",
     AttackerLevel.ORG_MEMBER: "Org Member",
     AttackerLevel.REPO_WRITE: "Repo Write\\n(compromised dev)",
     AttackerLevel.REPO_MAINTAIN: "Repo Maintainer",
@@ -74,58 +72,56 @@ _ENTRY_LABELS = {
 # ── Impact derivation ───────────────────────────────────────────
 
 def _derive_impact(f: BypassFinding) -> tuple[str, str]:
-    """Derive impact node (id, label) from a finding."""
+    """Derive a potential consequence label from a finding."""
     rid = f.rule_id
 
-    # Workflow execution → code exec + secrets
+    # Workflow-related potential consequences
     if rid == "GHOST-WF-001":
-        return "impact_code_exec", "Code Execution\\n+ Secret Exfil"
+        return "impact_code_exec", "Potential code execution\\n+ secret access"
     if rid == "GHOST-WF-004":
-        return "impact_secrets_fork", "Secrets Leaked\\nto Fork PRs"
+        return "impact_secrets_fork", "Potential secret exposure\\nacross workflow boundary"
     if rid == "GHOST-WF-003":
-        return "impact_secrets_inherit", "Secrets Exposed\\nvia Inheritance"
+        return "impact_secrets_inherit", "Potential secret exposure\\nvia inheritance"
     if rid == "GHOST-WF-002":
-        return "impact_write_all", "Write Access\\nto Repo + Packages"
+        return "impact_write_all", "Broad token permissions\\nif workflow is influenced"
     if rid == "GHOST-WF-005":
-        return "impact_supply_chain", "Supply Chain\\nCode Injection"
+        return "impact_supply_chain", "Potential upstream action\\ncode change"
     if rid == "GHOST-WF-006":
-        return "impact_remote_exec", "Remote Code Execution\\nvia Stolen PAT"
+        return "impact_remote_exec", "Sensitive manual run\\nif dispatcher is compromised"
     if rid == "GHOST-WF-007":
-        return "impact_repo_takeover", "Repo Modification\\n(releases, tags, code)"
+        return "impact_repo_write", "Potential repository\\nmodification"
     if rid == "GHOST-WF-008":
-        return "impact_malicious_publish", "Malicious Package\\nPublished"
+        return "impact_publish", "Potential unauthorized\\npublish"
 
     # OIDC → cloud
     if rid == "GHOST-OIDC-001":
-        return "impact_cloud_cross", "Cloud Role Assumption\\n(cross-repo)"
+        return "impact_cloud_cross", "Cloud trust-policy\\nreview required"
     if rid == "GHOST-OIDC-002":
-        return "impact_cloud_nogated", "Cloud Credentials\\n(no env gate)"
+        return "impact_cloud_nogated", "Potential OIDC token use\\nwithout reviewer gate"
 
     # Branch protection → unreviewed code
     if rid in ("GHOST-BP-001", "GHOST-BP-002", "GHOST-BP-005"):
-        return "impact_unreviewed", "Unreviewed Code\\nMerged to Main"
+        return "impact_unreviewed", "Potential review-policy\\nbypass"
     if rid == "GHOST-BP-003":
-        return "impact_no_codeowner", "Code Merged\\nWithout Owner Review"
-    if rid == "GHOST-BP-004":
-        return "impact_unprotected", "Push to Unprotected\\nDeploy Branch"
+        return "impact_no_codeowner", "Potential merge without\\nowner review"
     if rid == "GHOST-BP-006":
-        return "impact_ruleset_noop", "Ruleset Not Enforced\\n(evaluate only)"
+        return "impact_ruleset_noop", "Ruleset observes only\\n(evaluate mode)"
 
     # Environment → prod deploy
     if rid == "GHOST-ENV-001":
-        return "impact_prod_no_review", "Production Deploy\\n(no reviewers)"
+        return "impact_prod_no_review", "Deployment environment\\nwithout reviewers"
     if rid == "GHOST-ENV-002":
-        return "impact_prod_any_branch", "Production Deploy\\n(any branch)"
+        return "impact_prod_any_branch", "Deployment allowed\\nfrom any branch"
     if rid == "GHOST-ENV-003":
-        return "impact_prod_auto", "Production Deploy\\n(auto-approved)"
+        return "impact_timed_no_review", "Timed deployment\\nwithout reviewers"
 
-    return "impact_unknown", "Security Impact"
+    return "impact_unknown", "Potential security consequence"
 
 
 # ── Bypass node labels ───────────────────────────────────────────
 
 def _bypass_label(f: BypassFinding) -> str:
-    """Build a concise label for the bypassed gate."""
+    """Build a concise label for the finding node."""
     rid = f.rule_id
     ev = f.evidence
 
@@ -144,7 +140,7 @@ def _bypass_label(f: BypassFinding) -> str:
 
     if rid == "GHOST-WF-004":
         wf = ev.get("workflow", "?").split("/")[-1]
-        return f"✗ {wf}\\nsecrets exposed to forks"
+        return f"✗ {wf}\\nworkflow_run trust boundary"
 
     if rid == "GHOST-BP-001":
         branch = ev.get("branch", "?")
@@ -158,16 +154,12 @@ def _bypass_label(f: BypassFinding) -> str:
         branch = ev.get("branch", "?")
         return f"✗ Branch Protection\\n{branch}\\nno CODEOWNERS"
 
-    if rid == "GHOST-BP-004":
-        branches = ev.get("unprotected_branches", [])
-        br_str = ", ".join(branches[:3])
-        return f"✗ Unprotected Branches\\n{br_str}"
 
     if rid == "GHOST-BP-005":
-        return "✗ Workflow Self-Approval\\nauto-merge enabled"
+        return "✗ Actions PR approval\\nsetting enabled"
 
     if rid == "GHOST-BP-006":
-        rs = ev.get("ruleset", "?")
+        rs = ev.get("ruleset_name", "?")
         return f"✗ Ruleset '{rs}'\\nevaluate mode (not enforced)"
 
     if rid == "GHOST-ENV-001":
@@ -180,7 +172,7 @@ def _bypass_label(f: BypassFinding) -> str:
 
     if rid == "GHOST-ENV-003":
         env = ev.get("environment", "?")
-        return f"✗ Environment '{env}'\\nwait timer only"
+        return f"✗ Environment '{env}'\\nwait timer, no reviewers"
 
     if rid == "GHOST-OIDC-001":
         return "✗ OIDC Template\\ndefault subject claim"
@@ -220,7 +212,7 @@ def _sanitize_id(s: str) -> str:
 
 
 def build_repo_graph(repo: str, findings: list[BypassFinding]) -> RepoGraph:
-    """Build attack graph for a single repo."""
+    """Build a prerequisite → finding → potential-consequence view."""
     graph = RepoGraph(repo=repo)
     seen_nodes = set()
 
@@ -241,7 +233,7 @@ def build_repo_graph(repo: str, findings: list[BypassFinding]) -> RepoGraph:
             seen_nodes.add(entry_id)
 
         for f in level_findings:
-            # Bypass node
+            # Finding node
             bypass_id = f"bypass_{_sanitize_id(f.rule_id)}_{_sanitize_id(f.instance or 'default')}"
             if bypass_id not in seen_nodes:
                 graph.nodes.append(GraphNode(
@@ -253,7 +245,7 @@ def build_repo_graph(repo: str, findings: list[BypassFinding]) -> RepoGraph:
                 ))
                 seen_nodes.add(bypass_id)
 
-            # Impact node
+            # Potential consequence node
             impact_id, impact_label = _derive_impact(f)
             if impact_id not in seen_nodes:
                 graph.nodes.append(GraphNode(
@@ -263,7 +255,7 @@ def build_repo_graph(repo: str, findings: list[BypassFinding]) -> RepoGraph:
                 ))
                 seen_nodes.add(impact_id)
 
-            # Edges: entry → bypass → impact
+            # Edges are presentation relationships, not validated exploit steps.
             edge_entry = GraphEdge(src=entry_id, dst=bypass_id)
             edge_impact = GraphEdge(src=bypass_id, dst=impact_id)
 
@@ -278,7 +270,7 @@ def build_repo_graph(repo: str, findings: list[BypassFinding]) -> RepoGraph:
 
 
 def build_org_graph(findings: list[BypassFinding], org: str = "") -> OrgGraph:
-    """Build attack graphs for all repos in a scan."""
+    """Build finding relationship graphs for all repos in a scan."""
     by_repo: dict[str, list[BypassFinding]] = {}
     for f in findings:
         by_repo.setdefault(f.repo, []).append(f)
@@ -286,7 +278,7 @@ def build_org_graph(findings: list[BypassFinding], org: str = "") -> OrgGraph:
     graphs = []
     for repo, repo_findings in sorted(by_repo.items()):
         g = build_repo_graph(repo, repo_findings)
-        if g.edges:  # only include repos with actual paths
+        if g.edges:
             graphs.append(g)
 
     return OrgGraph(org=org, repo_graphs=graphs)
@@ -304,7 +296,7 @@ _SEV_STYLE = {
 
 
 def render_repo_mermaid(graph: RepoGraph) -> str:
-    """Render a single repo's attack graph as Mermaid."""
+    """Render a single repo's finding relationship graph as Mermaid."""
     lines: list[str] = []
     lines.append("graph LR")
 
@@ -317,7 +309,7 @@ def render_repo_mermaid(graph: RepoGraph) -> str:
             # Stadium shape for entry
             lines.append(f'    {nid}(["{label}"])')
         elif node.kind == NodeKind.BYPASS:
-            # Hexagon for bypassed gate
+            # Hexagon for a finding
             lines.append(f'    {nid}{{{{"{label}"}}}}')
         elif node.kind == NodeKind.IMPACT:
             # Double circle for impact
@@ -349,22 +341,22 @@ def render_repo_mermaid(graph: RepoGraph) -> str:
 
 
 def format_graph_mermaid(org_graph: OrgGraph) -> str:
-    """Render full org attack graph as Mermaid markdown."""
+    """Render the organization finding graph as Mermaid markdown."""
     lines: list[str] = []
 
     if org_graph.org:
-        lines.append(f"# GhostGates Attack Graph — {org_graph.org}")
+        lines.append(f"# GhostGates Finding Inference Graph — {org_graph.org}")
     else:
-        lines.append("# GhostGates Attack Graph")
+        lines.append("# GhostGates Finding Inference Graph")
     lines.append("")
 
     if not org_graph.repo_graphs:
-        lines.append("No attack paths found.")
+        lines.append("No matching findings to visualize.")
         return "\n".join(lines)
 
-    lines.append(f"**{len(org_graph.repo_graphs)} repos with attack paths**")
+    lines.append(f"**{len(org_graph.repo_graphs)} repos represented**")
     lines.append("")
-    lines.append("Legend: 🔵 Entry Point → 🔴 Bypassed Gate → 🟣 Impact")
+    lines.append("Legend: 🔵 Attacker prerequisite → 🔴 Finding → 🟣 Potential consequence")
     lines.append("")
 
     for rg in org_graph.repo_graphs:
@@ -379,7 +371,7 @@ def format_graph_mermaid(org_graph: OrgGraph) -> str:
 
 
 def format_graph_json(org_graph: OrgGraph) -> str:
-    """JSON representation of attack graphs."""
+    """JSON representation of finding relationship graphs."""
     return json.dumps(
         {
             "org": org_graph.org,
@@ -429,22 +421,22 @@ _SEV_COLOR_TERM = {
 
 
 def format_graph_terminal(org_graph: OrgGraph) -> str:
-    """ASCII kill chain view for terminal."""
+    """Terminal view of finding prerequisites and potential consequences."""
     lines: list[str] = []
 
     lines.append("")
     lines.append(f"{_BOLD}╔══════════════════════════════════════════════════════╗{_RESET}")
-    lines.append(f"{_BOLD}║  GhostGates Kill Chain                               ║{_RESET}")
+    lines.append(f"{_BOLD}║  GhostGates Finding Inference Graph                   ║{_RESET}")
     lines.append(f"{_BOLD}╚══════════════════════════════════════════════════════╝{_RESET}")
     lines.append("")
 
     if org_graph.org:
         lines.append(f"  Organization:  {org_graph.org}")
-    lines.append(f"  Repos:         {len(org_graph.repo_graphs)} with attack paths")
+    lines.append(f"  Repos:         {len(org_graph.repo_graphs)} represented")
     lines.append("")
 
     if not org_graph.repo_graphs:
-        lines.append(f"  {_DIM}No attack paths found.{_RESET}")
+        lines.append(f"  {_DIM}No matching findings to visualize.{_RESET}")
         return "\n".join(lines)
 
     for rg in org_graph.repo_graphs:

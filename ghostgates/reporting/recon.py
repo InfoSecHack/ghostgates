@@ -1,10 +1,8 @@
 """
 ghostgates/reporting/recon.py
 
-Recon view — reorganize findings by offensive attack question
-instead of by repo. Same data, different lens.
-
-No new API calls. No new rules. Just presentation.
+Review-question view: reorganize existing findings without adding observations
+or proving the inferred consequences.
 """
 
 from __future__ import annotations
@@ -16,7 +14,7 @@ from ghostgates.models.enums import AttackerLevel, Severity
 from ghostgates.models.findings import BypassFinding
 
 
-# ── Attack surface categories ────────────────────────────────────
+# ── Review categories ────────────────────────────────────────────
 
 # Each category is a (label, description, matcher) tuple.
 # matcher is a function that takes a finding and returns an
@@ -24,13 +22,13 @@ from ghostgates.models.findings import BypassFinding
 
 
 def _match_workflow_execution(f: BypassFinding) -> str | None:
-    """Repos where attacker can execute arbitrary workflow code."""
+    """Findings that warrant review of workflow execution boundaries."""
     if f.rule_id == "GHOST-WF-001":
         wf = f.evidence.get("workflow", "?")
         return f"PR head checkout in {wf.split('/')[-1]}"
     if f.rule_id == "GHOST-WF-004":
         wf = f.evidence.get("workflow", "?")
-        return f"workflow_run secrets leak via {wf.split('/')[-1]}"
+        return f"workflow_run trust boundary in {wf.split('/')[-1]}"
     if f.rule_id == "GHOST-WF-006":
         wf = f.evidence.get("workflow", "?").split("/")[-1]
         return f"workflow_dispatch + write perms ({wf})"
@@ -38,14 +36,14 @@ def _match_workflow_execution(f: BypassFinding) -> str | None:
 
 
 def _match_secrets_exposure(f: BypassFinding) -> str | None:
-    """Repos that expose secrets to untrusted contexts."""
+    """Findings that warrant review of secret or token exposure."""
     if f.rule_id == "GHOST-WF-003":
         wf = f.evidence.get("workflow", "?").split("/")[-1]
-        target = f.evidence.get("reusable_workflow", "external workflow")
+        target = f.evidence.get("reusable_workflow", "reusable workflow")
         return f"secrets: inherit → {target.split('/')[-1]} ({wf})"
     if f.rule_id == "GHOST-WF-004":
         wf = f.evidence.get("workflow", "?").split("/")[-1]
-        return f"fork PR secrets via workflow_run ({wf})"
+        return f"workflow_run may consume untrusted input ({wf})"
     if f.rule_id == "GHOST-WF-002" and f.evidence.get("scope") == "workflow":
         wf = f.evidence.get("workflow", "?").split("/")[-1]
         return f"write-all GITHUB_TOKEN ({wf})"
@@ -56,17 +54,14 @@ def _match_secrets_exposure(f: BypassFinding) -> str | None:
     return None
 
 
-def _match_code_to_prod_no_review(f: BypassFinding) -> str | None:
-    """Repos where code can reach production without human review."""
+def _match_review_controls(f: BypassFinding) -> str | None:
+    """Findings about missing or weakened review controls."""
     if f.rule_id == "GHOST-BP-001":
         branch = f.evidence.get("branch", "?")
         return f"admin bypass on {branch} (enforce_admins=false)"
     if f.rule_id == "GHOST-BP-002":
         branch = f.evidence.get("branch", "?")
         return f"stale approvals persist on {branch}"
-    if f.rule_id == "GHOST-BP-004":
-        branches = f.evidence.get("unprotected_branches", [])
-        return f"unprotected deployment branches: {', '.join(branches)}"
     if f.rule_id == "GHOST-ENV-001":
         env = f.evidence.get("environment", "?")
         return f"{env} env has no required reviewers"
@@ -74,14 +69,14 @@ def _match_code_to_prod_no_review(f: BypassFinding) -> str | None:
         env = f.evidence.get("environment", "?")
         return f"{env} env allows deploy from any branch"
     if f.rule_id == "GHOST-BP-005":
-        return "workflows can self-approve PRs"
+        return "Actions PR-approval setting is enabled"
     return None
 
 
-def _match_cloud_credential_theft(f: BypassFinding) -> str | None:
-    """Repos where OIDC tokens can be obtained without proper gates."""
+def _match_oidc_review(f: BypassFinding) -> str | None:
+    """Findings that warrant OIDC and cloud trust-policy review."""
     if f.rule_id == "GHOST-OIDC-001":
-        return "default OIDC template — cross-repo role assumption"
+        return "OIDC subject template may not include environment"
     if f.rule_id == "GHOST-OIDC-002":
         wf = f.evidence.get("workflow", "?").split("/")[-1]
         job = f.evidence.get("job", "?")
@@ -90,7 +85,7 @@ def _match_cloud_credential_theft(f: BypassFinding) -> str | None:
 
 
 def _match_prod_deployment_paths(f: BypassFinding) -> str | None:
-    """Workflows/environments that can deploy to production."""
+    """Findings associated with production-named workflows or environments."""
     ev = f.evidence
     # Environment findings for prod-like envs
     env_name = ev.get("environment", "").lower()
@@ -102,7 +97,7 @@ def _match_prod_deployment_paths(f: BypassFinding) -> str | None:
         if f.rule_id == "GHOST-ENV-002":
             return f"{ev.get('environment', '?')} — any branch can deploy"
         if f.rule_id == "GHOST-ENV-003":
-            return f"{ev.get('environment', '?')} — wait timer only, auto-approves"
+            return f"{ev.get('environment', '?')} — wait timer but no reviewers"
 
     # Write-all workflows that reference prod-like names
     if f.rule_id == "GHOST-WF-002":
@@ -110,17 +105,17 @@ def _match_prod_deployment_paths(f: BypassFinding) -> str | None:
         if any(p in wf for p in ("prod", "deploy", "release")):
             return f"{ev.get('workflow', '?').split('/')[-1]} — write-all permissions"
 
-    # Secrets inherit to external workflows
+    # Secrets inheritance in production-named workflows
     if f.rule_id == "GHOST-WF-003":
         wf = ev.get("workflow", "").lower()
         if any(p in wf for p in ("prod", "deploy", "release")):
-            return f"{ev.get('workflow', '?').split('/')[-1]} — secrets: inherit to external"
+            return f"{ev.get('workflow', '?').split('/')[-1]} — secrets: inherit"
 
     return None
 
 
 def _match_review_bypass(f: BypassFinding) -> str | None:
-    """Repos where branch protections can be circumvented."""
+    """Findings about branch and ruleset review controls."""
     if f.rule_id == "GHOST-BP-001":
         branch = f.evidence.get("branch", "?")
         return f"admins exempt from reviews on {branch}"
@@ -131,15 +126,15 @@ def _match_review_bypass(f: BypassFinding) -> str | None:
         branch = f.evidence.get("branch", "?")
         return f"no CODEOWNERS enforcement on {branch}"
     if f.rule_id == "GHOST-BP-005":
-        return "workflow self-approval + auto-merge"
+        return "Actions PR-approval setting is enabled"
     if f.rule_id == "GHOST-BP-006":
-        rs = f.evidence.get("ruleset", "?")
+        rs = f.evidence.get("ruleset_name", "?")
         return f"ruleset '{rs}' in evaluate mode (not enforced)"
     return None
 
 
 def _match_supply_chain(f: BypassFinding) -> str | None:
-    """Repos vulnerable to supply chain injection."""
+    """Findings that warrant dependency and publishing review."""
     if f.rule_id == "GHOST-WF-005":
         wf = f.evidence.get("workflow", "?").split("/")[-1]
         count = f.evidence.get("unpinned_count", "?")
@@ -170,7 +165,7 @@ class ReconHit:
 
 @dataclass
 class ReconCategory:
-    """An attack surface category with hits."""
+    """A security-review category with hits."""
     key: str
     title: str
     question: str
@@ -190,7 +185,7 @@ class ReconResult:
         return sum(len(c.hits) for c in self.categories)
 
     @property
-    def repos_exposed(self) -> int:
+    def repos_represented(self) -> int:
         repos = set()
         for cat in self.categories:
             for hit in cat.hits:
@@ -202,50 +197,50 @@ class ReconResult:
 _CATEGORIES = [
     (
         "workflow_exec",
-        "Attacker-Controlled Workflow Execution",
-        "Which repos allow attacker-controlled code execution in workflows?",
+        "Workflow Execution Boundaries",
+        "Which findings need review for attacker-influenced workflow execution?",
         AttackerLevel.EXTERNAL,
         _match_workflow_execution,
     ),
     (
         "secrets",
-        "Secrets Exposure",
-        "Which pipelines expose secrets to untrusted contexts?",
+        "Secrets and Token Exposure",
+        "Which findings need review for secret or token exposure?",
         AttackerLevel.EXTERNAL,
         _match_secrets_exposure,
     ),
     (
         "cloud_creds",
-        "Cloud Credential Theft (OIDC)",
-        "Which repos allow unauthorized cloud role assumption?",
+        "OIDC Trust Boundaries",
+        "Which findings need comparison with the cloud trust policy?",
         AttackerLevel.REPO_WRITE,
-        _match_cloud_credential_theft,
+        _match_oidc_review,
     ),
     (
         "code_to_prod",
-        "Code to Production Without Review",
-        "Which repos allow code to reach prod without human review?",
+        "Review Controls",
+        "Which observed settings may weaken a human-review boundary?",
         AttackerLevel.REPO_WRITE,
-        _match_code_to_prod_no_review,
+        _match_review_controls,
     ),
     (
         "prod_deploy",
-        "Production Deployment Paths",
-        "Which workflows can deploy to production?",
+        "Production-Named Configuration",
+        "Which findings reference production-named workflows or environments?",
         AttackerLevel.REPO_WRITE,
         _match_prod_deployment_paths,
     ),
     (
         "review_bypass",
-        "Review Bypass Paths",
-        "Which repos have circumventable branch protections?",
+        "Branch and Ruleset Review",
+        "Which branch or ruleset controls need review?",
         AttackerLevel.REPO_WRITE,
         _match_review_bypass,
     ),
     (
         "supply_chain",
-        "Supply Chain Injection",
-        "Which repos are vulnerable to upstream dependency poisoning?",
+        "Dependencies and Publishing",
+        "Which findings need dependency or publish-boundary review?",
         AttackerLevel.EXTERNAL,
         _match_supply_chain,
     ),
@@ -290,9 +285,7 @@ def build_recon(findings: list[BypassFinding], org: str = "") -> ReconResult:
 # ── Formatters ───────────────────────────────────────────────────
 
 _BOLD = "\033[1m"
-_RED = "\033[31m"
 _YELLOW = "\033[33m"
-_GREEN = "\033[32m"
 _CYAN = "\033[36m"
 _DIM = "\033[2m"
 _RESET = "\033[0m"
@@ -305,14 +298,6 @@ _SEV_COLOR = {
     Severity.INFO: "\033[2m",
 }
 
-_PRIV_LABEL = {
-    AttackerLevel.EXTERNAL: f"{_RED}NO CREDS{_RESET}",
-    AttackerLevel.ORG_MEMBER: "org-member",
-    AttackerLevel.REPO_WRITE: "repo-write",
-    AttackerLevel.REPO_MAINTAIN: "repo-maintain",
-    AttackerLevel.REPO_ADMIN: "repo-admin",
-    AttackerLevel.ORG_OWNER: "org-owner",
-}
 
 
 def format_recon_terminal(result: ReconResult) -> str:
@@ -321,14 +306,14 @@ def format_recon_terminal(result: ReconResult) -> str:
 
     lines.append("")
     lines.append(f"{_BOLD}╔══════════════════════════════════════════════════════╗{_RESET}")
-    lines.append(f"{_BOLD}║  GhostGates Attack Surface                           ║{_RESET}")
+    lines.append(f"{_BOLD}║  GhostGates Review Questions                         ║{_RESET}")
     lines.append(f"{_BOLD}╚══════════════════════════════════════════════════════╝{_RESET}")
     lines.append("")
 
     if result.org:
         lines.append(f"  Organization:  {result.org}")
     lines.append(f"  Findings:      {result.total_findings}")
-    lines.append(f"  Repos exposed: {result.repos_exposed}")
+    lines.append(f"  Repos represented: {result.repos_represented}")
     lines.append("")
 
     for cat in result.categories:
@@ -336,8 +321,7 @@ def format_recon_terminal(result: ReconResult) -> str:
             continue
 
         # Category header
-        priv = _PRIV_LABEL.get(cat.min_privilege, str(cat.min_privilege))
-        lines.append(f"  {_BOLD}{_CYAN}── {cat.title} ──{_RESET}  {_DIM}(requires: {priv}){_RESET}")
+        lines.append(f"  {_BOLD}{_CYAN}── {cat.title} ──{_RESET}")
         lines.append(f"  {_DIM}{cat.question}{_RESET}")
         lines.append("")
 
@@ -352,16 +336,17 @@ def format_recon_terminal(result: ReconResult) -> str:
                 sev_c = _SEV_COLOR.get(hit.severity, "")
                 lines.append(
                     f"      {sev_c}→{_RESET} {hit.description}"
-                    f"  {_DIM}({hit.rule_id}){_RESET}"
+                    f"  {_DIM}({hit.rule_id}; prerequisite: "
+                    f"{hit.min_privilege.value}){_RESET}"
                 )
             lines.append("")
 
     # Empty categories summary
     empty = [c for c in result.categories if not c.hits]
     if empty:
-        lines.append(f"  {_GREEN}── Clean ──{_RESET}")
+        lines.append(f"  {_DIM}── No matching findings (not proof of absence) ──{_RESET}")
         for cat in empty:
-            lines.append(f"    {_GREEN}✓{_RESET} {cat.title}")
+            lines.append(f"    {_DIM}– {cat.title}{_RESET}")
         lines.append("")
 
     return "\n".join(lines)
@@ -373,7 +358,7 @@ def format_recon_json(result: ReconResult) -> str:
         {
             "org": result.org,
             "total_findings": result.total_findings,
-            "repos_exposed": result.repos_exposed,
+            "repos_represented": result.repos_represented,
             "categories": [
                 {
                     "key": cat.key,
@@ -404,12 +389,12 @@ def format_recon_markdown(result: ReconResult) -> str:
     """Markdown recon output."""
     lines: list[str] = []
 
-    lines.append("# GhostGates Attack Surface Report")
+    lines.append("# GhostGates Review Questions")
     lines.append("")
     if result.org:
         lines.append(f"**Organization:** {result.org}")
     lines.append(f"**Total findings:** {result.total_findings}")
-    lines.append(f"**Repos exposed:** {result.repos_exposed}")
+    lines.append(f"**Repos represented:** {result.repos_represented}")
     lines.append("")
 
     for cat in result.categories:
@@ -418,14 +403,14 @@ def format_recon_markdown(result: ReconResult) -> str:
 
         lines.append(f"## {cat.title}")
         lines.append(f"*{cat.question}*")
-        lines.append(f"Minimum privilege: `{cat.min_privilege.value}`")
+        lines.append("Attacker prerequisites are reported per finding.")
         lines.append("")
 
-        lines.append("| Repo | Path | Rule | Severity |")
-        lines.append("|------|------|------|----------|")
+        lines.append("| Repo | Review note | Rule | Severity | Prerequisite |")
+        lines.append("|------|-------------|------|----------|--------------|")
         for hit in cat.hits:
             lines.append(
-                f"| {hit.repo} | {hit.description} | {hit.rule_id} | {hit.severity.value} |"
+                f"| {hit.repo} | {hit.description} | {hit.rule_id} | {hit.severity.value} | {hit.min_privilege.value} |"
             )
         lines.append("")
 

@@ -1,14 +1,12 @@
 """
 ghostgates/engine/rules/workflow.py
 
-Workflow bypass rules (GHOST-WF-001 through GHOST-WF-004).
-
-WF-001 (pull_request_target + checkout) is the highest-impact rule
-in the entire project — it detects the exact pattern used in real-world
-supply chain attacks.
+Workflow configuration rules (GHOST-WF-001 through GHOST-WF-008).
 """
 
 from __future__ import annotations
+
+import re
 
 from ghostgates.engine.registry import registry
 from ghostgates.engine.urls import actions_url, workflow_file_url
@@ -37,18 +35,13 @@ def wf_001_pr_target_checkout(gate: GateModel) -> list[BypassFinding]:
     """Detects workflows triggered by pull_request_target that check out
     the PR head ref, then execute code from that checkout.
 
-    Impact: CRITICAL. An external attacker (no repo access needed) can
-    submit a PR that modifies workflow files or build scripts. Because
-    pull_request_target runs in the context of the BASE branch (with
-    its secrets and write permissions), checking out the PR HEAD means
-    the attacker's code runs with the base branch's elevated privileges.
-
-    This is the exact pattern behind real supply chain attacks.
+    The base-branch context may have sensitive credentials, but their
+    availability and scopes are separate configuration prerequisites.
 
     Detection logic:
       1. Workflow has pull_request_target trigger
       2. A job checks out with ref containing "pull_request.head" or "github.head_ref"
-      3. A subsequent step runs code (uses: or run:)
+      3. A subsequent shell step or local action runs checked-out code
     """
     findings: list[BypassFinding] = []
 
@@ -67,6 +60,11 @@ def wf_001_pr_target_checkout(gate: GateModel) -> list[BypassFinding]:
 
             checkout_ref = danger["checkout_ref"]
             runs_code = danger["runs_code"]
+            execution_is_certain = danger["execution_is_certain"]
+            min_privilege = (
+                AttackerLevel.EXTERNAL if gate.visibility == "public"
+                else AttackerLevel.ORG_MEMBER
+            )
 
             findings.append(BypassFinding(
                 rule_id="GHOST-WF-001",
@@ -74,21 +72,24 @@ def wf_001_pr_target_checkout(gate: GateModel) -> list[BypassFinding]:
                 repo=gate.full_name,
                 gate_type=GateType.WORKFLOW,
                 severity=Severity.CRITICAL,
-                confidence=Confidence.HIGH,
-                min_privilege=AttackerLevel.EXTERNAL,
+                confidence=(
+                    Confidence.HIGH if execution_is_certain else Confidence.MEDIUM
+                ),
+                min_privilege=min_privilege,
                 summary=(
                     f"Workflow '{wf.name}' ({wf.path}) uses pull_request_target "
-                    f"and checks out PR head code — external attacker can execute "
-                    f"arbitrary code with base branch privileges."
+                    f"and {'executes' if execution_is_certain else 'may execute'} "
+                    f"checked-out PR head code in the base-branch workflow context."
                 ),
                 bypass_path=(
-                    f"1. Workflow '{wf.path}' triggers on pull_request_target\n"
-                    f"2. Job '{job.name}' checks out PR head: ref={checkout_ref}\n"
-                    f"3. Subsequent step executes code: {runs_code}\n"
-                    f"4. pull_request_target runs with BASE branch context "
-                    f"(secrets, GITHUB_TOKEN with write perms)\n"
-                    f"5. External attacker submits PR with modified build scripts\n"
-                    f"6. Attacker's code executes with elevated privileges"
+                    f"Observed: workflow '{wf.path}' triggers on pull_request_target\n"
+                    f"Observed: job '{job.name}' checks out PR head: ref={checkout_ref}\n"
+                    f"{'Observed' if execution_is_certain else 'Inference'}: a later "
+                    f"step {'executes' if execution_is_certain else 'may execute'} "
+                    f"checked-out code: {runs_code}\n"
+                    f"Inference: a PR author may influence code running in the "
+                    f"base-branch workflow context\n"
+                    f"Potential consequence: credentials granted to that job may be exposed"
                 ),
                 evidence={
                     "workflow": wf.path,
@@ -97,10 +98,12 @@ def wf_001_pr_target_checkout(gate: GateModel) -> list[BypassFinding]:
                     "checkout_ref": checkout_ref,
                     "code_execution": runs_code,
                     "trigger": "pull_request_target",
+                    "execution_is_certain": execution_is_certain,
                 },
                 gating_conditions=[
-                    "Attacker must be able to open a pull request (public repo or org member)",
+                    "Attacker must be able to open a pull request",
                     "Workflow must not have an 'if' condition that prevents execution on external PRs",
+                    "Sensitive impact requires secrets or a privileged GITHUB_TOKEN to be available",
                 ],
                 remediation=(
                     f"Option 1: Change trigger from pull_request_target to pull_request "
@@ -140,21 +143,66 @@ def _detect_pr_head_checkout_danger(job: WorkflowJob) -> dict | None:
     if checkout_ref is None:
         return None
 
-    # Look for code execution AFTER the checkout
+    # Certain evidence dominates an earlier ambiguous remote-action signal.
+    inferred_danger = None
     for step in job.steps[checkout_index + 1:]:
         if step.run:
             return {
                 "checkout_ref": checkout_ref,
                 "runs_code": f"run: {step.run[:80]}",
+                "execution_is_certain": True,
             }
-        if step.uses and "actions/checkout" not in step.uses:
-            # Any action other than checkout could execute attacker code
-            # if it operates on the checked-out repo
+        if step.uses.startswith("./"):
             return {
                 "checkout_ref": checkout_ref,
-                "runs_code": f"uses: {step.uses}",
+                "runs_code": f"local action: {step.uses}",
+                "execution_is_certain": True,
+            }
+        execution_input = _remote_execution_input(step.uses, step.with_)
+        if execution_input and inferred_danger is None:
+            inferred_danger = {
+                "checkout_ref": checkout_ref,
+                "runs_code": execution_input,
+                "execution_is_certain": False,
             }
 
+    return inferred_danger
+
+
+_EXECUTION_INPUT_KEYS = {
+    "args", "arguments", "cmd", "command", "goals", "script", "tasks",
+}
+_EXECUTION_TERMS = {
+    "assemble", "build", "check", "deploy", "gradle", "install", "make",
+    "mvn", "npm", "package", "pip", "publish", "run", "test", "yarn",
+}
+
+
+def _execution_tokens(value: object) -> set[str]:
+    """Normalize scalar or list action inputs without substring matching."""
+    if isinstance(value, (list, tuple, set)):
+        tokens: set[str] = set()
+        for item in value:
+            tokens.update(_execution_tokens(item))
+        return tokens
+    if not isinstance(value, (str, int, float, bool)):
+        return set()
+    return set(re.findall(r"[a-z0-9_.-]+", str(value).lower()))
+
+
+def _remote_execution_input(uses: str, inputs: dict) -> str | None:
+    """Describe a remote action input that plausibly runs repository code.
+
+    A remote action reference alone does not demonstrate code execution, so
+    setup-only actions are not reported merely because they follow checkout.
+    """
+    if not uses or uses.startswith("./"):
+        return None
+    for key, value in inputs.items():
+        if key.lower() not in _EXECUTION_INPUT_KEYS:
+            continue
+        if _execution_tokens(value) & _EXECUTION_TERMS:
+            return f"remote action: {uses} with {key}={str(value)[:80]}"
     return None
 
 
@@ -185,14 +233,8 @@ def _is_pr_head_ref(ref: str) -> bool:
 def wf_002_write_all_permissions(gate: GateModel) -> list[BypassFinding]:
     """Detects workflows or jobs with write-all token permissions.
 
-    Impact: A workflow with write-all permissions gets a GITHUB_TOKEN
-    that can push code, approve PRs, create releases, modify packages,
-    write to issues, and more. If the workflow is triggerable by an
-    attacker (via PR, workflow_dispatch, or dependency), the token
-    becomes an escalation vector.
-
-    Also flags when the org/repo default is write and the workflow
-    doesn't explicitly restrict permissions.
+    The permission is observed. A security consequence also requires an
+    attacker-reachable workflow and steps that use a granted write scope.
     """
     findings: list[BypassFinding] = []
 
@@ -230,10 +272,11 @@ def wf_002_write_all_permissions(gate: GateModel) -> list[BypassFinding]:
                         f"from org/repo default — no explicit permissions block."
                     ),
                     bypass_path=(
-                        f"1. Org/repo default_workflow_permissions is 'write'\n"
-                        f"2. Workflow '{wf.path}' has no permissions block\n"
-                        f"3. GITHUB_TOKEN gets write access to all scopes\n"
-                        f"4. Any step can push code, approve PRs, modify packages"
+                        f"Observed: org/repo default_workflow_permissions is 'write'\n"
+                        f"Observed: workflow '{wf.path}' has no permissions block\n"
+                        f"Inference: jobs without narrower permissions inherit token write scopes\n"
+                        f"Potential consequence depends on reachable triggers, workflow steps, "
+                        f"and other repository controls"
                     ),
                     evidence={
                         "workflow": wf.path,
@@ -279,14 +322,14 @@ def _make_wf002_finding(
         confidence=Confidence.HIGH,
         min_privilege=AttackerLevel.REPO_WRITE,
         summary=(
-            f"Workflow '{wf.name}' ({wf.path}) has write-all permissions "
-            f"at {scope} — GITHUB_TOKEN can push code, approve PRs, and more."
+            f"Workflow '{wf.name}' ({wf.path}) requests write-all permissions "
+            f"at {scope}."
         ),
         bypass_path=(
-            f"1. Workflow '{wf.path}' has permissions: {perms_value} at {scope}\n"
-            f"2. GITHUB_TOKEN gets write access to all scopes\n"
-            f"3. Any step can push code, approve PRs, create releases, modify packages\n"
-            f"4. If workflow is triggerable by attacker, token becomes escalation vector"
+            f"Observed: workflow '{wf.path}' has permissions: {perms_value} at {scope}\n"
+            f"Inference: its jobs can receive token write scopes\n"
+            f"Unobserved prerequisites: an attacker-reachable trigger and steps that use "
+            f"a security-sensitive write scope"
         ),
         evidence={
             "workflow": wf.path,
@@ -322,15 +365,8 @@ def _make_wf002_finding(
 def wf_003_secrets_inherit(gate: GateModel) -> list[BypassFinding]:
     """Detects workflows calling reusable workflows with secrets: inherit.
 
-    Impact: secrets: inherit passes ALL repository secrets to the
-    reusable workflow. If the reusable workflow is in a different repo
-    or uses a mutable ref (branch instead of SHA), the called workflow
-    could be modified to exfiltrate secrets.
-
-    This is particularly dangerous when:
-      - The reusable workflow is in a different org
-      - The ref is a branch (not a pinned SHA/tag)
-      - The calling workflow is triggered by external events
+    The called workflow receives secrets made available by the caller.
+    A cross-repository call or mutable ref expands the trust boundary.
     """
     findings: list[BypassFinding] = []
 
@@ -342,14 +378,12 @@ def wf_003_secrets_inherit(gate: GateModel) -> list[BypassFinding]:
                 continue
 
             is_external = _is_external_reusable(job.uses, gate.org)
-            is_mutable_ref = _is_mutable_ref(job.uses)
-
-            severity = Severity.HIGH if (is_external or is_mutable_ref) else Severity.MEDIUM
+            is_mutable_ref = not job.uses.startswith("./") and _is_mutable_ref(job.uses)
 
             ref_warning = ""
             if is_mutable_ref:
                 ref_warning = (
-                    f"\n4. Reusable workflow uses a mutable ref (branch) — "
+                    f"\nObserved: the reusable workflow uses a mutable ref, so "
                     f"the called workflow can change without notice"
                 )
 
@@ -358,18 +392,19 @@ def wf_003_secrets_inherit(gate: GateModel) -> list[BypassFinding]:
                 rule_name="Reusable workflow with secrets: inherit",
                 repo=gate.full_name,
                 gate_type=GateType.WORKFLOW,
-                severity=severity,
-                confidence=Confidence.HIGH if is_external else Confidence.MEDIUM,
+                severity=Severity.MEDIUM,
+                confidence=Confidence.MEDIUM,
                 min_privilege=AttackerLevel.REPO_WRITE,
                 summary=(
                     f"Job '{job.name}' in '{wf.path}' calls reusable workflow "
-                    f"'{job.uses}' with secrets: inherit — all secrets are passed."
+                    f"'{job.uses}' with secrets: inherit."
                 ),
                 bypass_path=(
-                    f"1. Workflow '{wf.path}' job '{job.name}' calls: {job.uses}\n"
-                    f"2. secrets: inherit passes ALL repository secrets\n"
-                    f"3. {'External' if is_external else 'Internal'} reusable workflow "
-                    f"receives all secrets"
+                    f"Observed: workflow '{wf.path}' job '{job.name}' calls: {job.uses}\n"
+                    f"Observed: the call uses secrets: inherit\n"
+                    f"Inference: the {'external' if is_external else 'internal'} reusable "
+                    f"workflow may receive caller secrets that are eligible for inheritance\n"
+                    f"Unobserved prerequisite: the caller has eligible secrets and the called workflow uses them"
                     + ref_warning
                 ),
                 evidence={
@@ -381,15 +416,20 @@ def wf_003_secrets_inherit(gate: GateModel) -> list[BypassFinding]:
                     "is_mutable_ref": is_mutable_ref,
                 },
                 gating_conditions=[
-                    "Attacker must be able to modify the reusable workflow "
-                    "(if external, needs write access to that repo)",
+                    "Caller must have secrets eligible for inheritance",
+                    "The called workflow must consume an inherited secret",
+                    "A hostile consequence requires attacker influence over the called workflow or its inputs",
                 ],
                 remediation=(
                     f"Replace 'secrets: inherit' with explicit secret passthrough:\n"
                     f"  secrets:\n"
                     f"    DEPLOY_KEY: ${{{{ secrets.DEPLOY_KEY }}}}\n"
-                    f"This limits which secrets the reusable workflow can access. "
-                    f"Also pin the reusable workflow to a SHA instead of a branch.\n"
+                    f"This limits which secrets the reusable workflow can access."
+                    + (
+                        " Pin cross-repository reusable workflows to a full commit SHA."
+                        if not job.uses.startswith("./") else ""
+                    )
+                    + "\n"
                     f"→ {workflow_file_url(gate.full_name, wf.path)}"
                 ),
                 settings_url=workflow_file_url(gate.full_name, wf.path),
@@ -404,30 +444,19 @@ def _is_external_reusable(uses: str, current_org: str) -> bool:
     if "/" not in uses:
         return False
     org_part = uses.split("/")[0]
-    return org_part != current_org
+    return org_part.lower() != current_org.lower()
 
 
 def _is_mutable_ref(uses: str) -> bool:
-    """Check if a reusable workflow uses a mutable ref (branch vs SHA/tag).
-
-    Mutable: @main, @develop, @v1
-    Immutable: @abc123def (40-char SHA), @v1.2.3 (semver tag)
-    """
+    """Only a full commit SHA is treated as immutable."""
     if "@" not in uses:
-        return True  # no ref at all — very mutable
+        return True
 
     ref = uses.split("@")[-1]
-
-    # SHA: 40 hex characters
-    if len(ref) == 40 and all(c in "0123456789abcdef" for c in ref):
-        return False
-
-    # Semver tag: vX.Y.Z
-    if ref.startswith("v") and ref.count(".") >= 2:
-        return False
-
-    # Everything else (branch names) is mutable
-    return True
+    return not (
+        len(ref) == 40
+        and all(c in "0123456789abcdefABCDEF" for c in ref)
+    )
 
 
 # ==================================================================
@@ -436,22 +465,16 @@ def _is_mutable_ref(uses: str) -> bool:
 
 @registry.rule(
     rule_id="GHOST-WF-004",
-    name="Workflow exposes secrets to fork PRs",
+    name="workflow_run trust-boundary review",
     gate_type=GateType.WORKFLOW,
     min_privilege=AttackerLevel.EXTERNAL,
     tags=("workflow", "fork", "secrets", "public-repo"),
 )
 def wf_004_fork_pr_secrets(gate: GateModel) -> list[BypassFinding]:
-    """Detects workflows in public repos that may expose secrets to fork PRs.
+    """Flags workflow_run usage in public repositories for trust review.
 
-    Impact: In public repos, pull_request from forks don't get secrets
-    by default. But pull_request_target DOES run with base branch
-    secrets. This rule checks for public repos with pull_request_target
-    workflows that don't already trigger WF-001.
-
-    Also flags workflows using workflow_run triggered by PR workflows,
-    which is a common pattern to work around fork PR secret restrictions
-    but can be exploited.
+    The trigger alone does not establish that untrusted artifacts are consumed
+    or that secrets are exposed.
     """
     findings: list[BypassFinding] = []
 
@@ -459,29 +482,28 @@ def wf_004_fork_pr_secrets(gate: GateModel) -> list[BypassFinding]:
         return []  # only relevant for public repos
 
     for wf in gate.workflows:
-        # Check for workflow_run triggered by PR events
         for trigger in wf.triggers:
             if trigger.event == "workflow_run":
-                # workflow_run triggered by another workflow can access secrets
                 findings.append(BypassFinding(
                     rule_id="GHOST-WF-004",
-                    rule_name="Workflow exposes secrets to fork PRs",
+                    rule_name="workflow_run trust-boundary review",
                     repo=gate.full_name,
                     gate_type=GateType.WORKFLOW,
-                    severity=Severity.HIGH,
+                    severity=Severity.MEDIUM,
                     confidence=Confidence.MEDIUM,
                     min_privilege=AttackerLevel.EXTERNAL,
                     summary=(
-                        f"Workflow '{wf.name}' ({wf.path}) uses workflow_run trigger "
-                        f"in a public repo — may expose secrets to fork PR workflows."
+                        f"Workflow '{wf.name}' ({wf.path}) uses workflow_run "
+                        f"in a public repo; review whether it consumes untrusted "
+                        f"artifacts or data in a privileged context."
                     ),
                     bypass_path=(
-                        f"1. Public repo {gate.full_name} has workflow '{wf.path}'\n"
-                        f"2. Workflow triggers on workflow_run event\n"
-                        f"3. workflow_run receives secrets from the base branch\n"
-                        f"4. If the triggering workflow is a fork PR, attacker's "
-                        f"code may influence the workflow_run context\n"
-                        f"5. Attacker can potentially exfiltrate secrets"
+                        f"Observed: public repo {gate.full_name} has workflow '{wf.path}'\n"
+                        f"Observed: workflow triggers on workflow_run\n"
+                        f"Inference: data from a less-trusted triggering workflow may cross "
+                        f"into a more-privileged workflow\n"
+                        f"Potential consequence: unsafe artifact or input handling could "
+                        f"expose credentials"
                     ),
                     evidence={
                         "workflow": wf.path,
@@ -492,6 +514,7 @@ def wf_004_fork_pr_secrets(gate: GateModel) -> list[BypassFinding]:
                         "Repo must be public",
                         "workflow_run must process data from the PR workflow",
                         "Attacker must be able to fork the repo and submit a PR",
+                        "Sensitive impact requires credentials in the workflow_run job",
                     ],
                     remediation=(
                         f"Audit workflow '{wf.path}' to ensure workflow_run does not "
@@ -513,54 +536,44 @@ def wf_004_fork_pr_secrets(gate: GateModel) -> list[BypassFinding]:
 # GHOST-WF-005: Unpinned action references (mutable tags/branches)
 # ==================================================================
 
-_KNOWN_FIRST_PARTY = frozenset({
-    "actions/checkout",
-    "actions/setup-node",
-    "actions/setup-python",
-    "actions/setup-java",
-    "actions/setup-go",
-    "actions/setup-dotnet",
-    "actions/cache",
-    "actions/upload-artifact",
-    "actions/download-artifact",
-    "actions/github-script",
-    "github/codeql-action",
-})
+_FIRST_PARTY_OWNERS = frozenset({"actions", "github"})
 
 
 def _is_pinned_ref(uses: str) -> bool:
     """Check if an action reference is pinned to a SHA."""
     if "@" not in uses:
         return False
-    ref = uses.split("@")[-1]
-    # SHA: 40 hex chars
-    return len(ref) == 40 and all(c in "0123456789abcdef" for c in ref)
+    ref = uses.rsplit("@", 1)[-1]
+    return len(ref) == 40 and all(c in "0123456789abcdefABCDEF" for c in ref)
 
 
 def _is_first_party(uses: str) -> bool:
     """Check if action is from actions/ or github/ org."""
     action_path = uses.split("@")[0] if "@" in uses else uses
-    return any(action_path.startswith(fp) for fp in _KNOWN_FIRST_PARTY)
+    owner = action_path.split("/", 1)[0].lower()
+    return owner in _FIRST_PARTY_OWNERS
+
+
+def _is_third_party_ref(uses: str, current_org: str) -> bool:
+    """Return whether an action/workflow reference crosses the organization boundary."""
+    if uses.startswith(("./", "docker://")):
+        return False
+    owner = uses.split("/", 1)[0].lower()
+    return owner != current_org.lower() and not _is_first_party(uses)
 
 
 @registry.rule(
     rule_id="GHOST-WF-005",
-    name="Unpinned third-party action reference",
+    name="Mutable third-party action reference",
     gate_type=GateType.WORKFLOW,
     min_privilege=AttackerLevel.EXTERNAL,
     tags=("workflow", "supply-chain", "pinning", "actions"),
 )
 def wf_005_unpinned_actions(gate: GateModel) -> list[BypassFinding]:
-    """Detects third-party actions referenced by mutable tag/branch.
+    """Detects third-party actions referenced by a mutable tag or branch.
 
-    Impact: Tag references (@v3, @main) can be force-pushed by the
-    action maintainer — or an attacker who compromises their repo.
-    This is the exact vector used in the tj-actions/changed-files
-    supply chain attack and the March 2026 campaign that hit Trivy,
-    Microsoft, DataDog, and CNCF repos.
-
-    Only flags third-party actions (not actions/ or github/ org).
-    First-party actions are lower risk because GitHub controls them.
+    A mutable reference is observed. Execution of malicious code additionally
+    requires compromise or malicious modification of the referenced upstream.
     """
     findings: list[BypassFinding] = []
 
@@ -569,7 +582,7 @@ def wf_005_unpinned_actions(gate: GateModel) -> list[BypassFinding]:
 
         for job in wf.jobs:
             # Reusable workflow ref
-            if job.uses and not _is_pinned_ref(job.uses):
+            if job.uses and _is_third_party_ref(job.uses, gate.org) and not _is_pinned_ref(job.uses):
                 unpinned.append({
                     "job": job.name,
                     "ref": job.uses,
@@ -579,10 +592,10 @@ def wf_005_unpinned_actions(gate: GateModel) -> list[BypassFinding]:
             for step in job.steps:
                 if not step.uses or "actions/checkout" == step.uses.split("@")[0]:
                     continue
+                if not _is_third_party_ref(step.uses, gate.org):
+                    continue
                 if _is_pinned_ref(step.uses):
                     continue
-                if _is_first_party(step.uses):
-                    continue  # skip actions/ and github/ orgs
 
                 unpinned.append({
                     "job": job.name,
@@ -609,25 +622,25 @@ def wf_005_unpinned_actions(gate: GateModel) -> list[BypassFinding]:
 
         findings.append(BypassFinding(
             rule_id="GHOST-WF-005",
-            rule_name="Unpinned third-party action reference",
+            rule_name="Mutable third-party action reference",
             repo=gate.full_name,
             gate_type=GateType.WORKFLOW,
-            severity=Severity.HIGH,
+            severity=Severity.MEDIUM,
             confidence=Confidence.HIGH,
             min_privilege=AttackerLevel.EXTERNAL,
             summary=(
                 f"Workflow '{wf.name}' ({wf.path}) uses {len(unique_unpinned)} "
-                f"unpinned third-party action(s) — vulnerable to supply chain "
-                f"tag poisoning."
+                f"third-party action reference(s) that are not pinned to full "
+                f"commit SHAs."
             ),
             bypass_path=(
-                f"1. Workflow '{wf.path}' references third-party actions by "
-                f"mutable tag or branch\n"
-                f"2. Unpinned references:\n{refs_list}\n"
-                f"3. Attacker compromises one action's repo\n"
-                f"4. Attacker force-pushes the tag to inject malicious code\n"
-                f"5. Next workflow run executes attacker's code with "
-                f"GITHUB_TOKEN permissions"
+                f"Observed: workflow '{wf.path}' references third-party actions "
+                f"by mutable tag or branch\n"
+                f"Observed references:\n{refs_list}\n"
+                f"Prerequisite: an upstream maintainer or attacker changes the "
+                f"resolved reference\n"
+                f"Potential consequence: a later workflow run executes the changed action "
+                f"with the job's configured permissions"
             ),
             evidence={
                 "workflow": wf.path,
@@ -662,22 +675,16 @@ def wf_005_unpinned_actions(gate: GateModel) -> list[BypassFinding]:
 
 @registry.rule(
     rule_id="GHOST-WF-006",
-    name="workflow_dispatch with write permissions",
+    name="Manual workflow trigger with write permissions",
     gate_type=GateType.WORKFLOW,
     min_privilege=AttackerLevel.REPO_WRITE,
     tags=("workflow", "dispatch", "remote-trigger", "supply-chain"),
 )
 def wf_006_dispatch_write(gate: GateModel) -> list[BypassFinding]:
-    """Detects workflow_dispatch workflows with write permissions.
+    """Flags manual workflow entry points with write permissions.
 
-    Impact: workflow_dispatch can be triggered remotely via API with
-    any PAT that has repo scope. If the workflow has write permissions
-    (explicit or inherited), a stolen PAT becomes a remote code
-    execution vector — the attacker can trigger the workflow and it
-    runs with write access to contents, packages, and more.
-
-    This is the attack pattern used against Trivy: stolen PAT +
-    workflow with elevated permissions = repo takeover.
+    The trigger and permission are observed; harmful behavior additionally
+    depends on who can dispatch the workflow and what its steps and inputs do.
     """
     findings: list[BypassFinding] = []
     default_is_write = (
@@ -708,10 +715,10 @@ def wf_006_dispatch_write(gate: GateModel) -> list[BypassFinding]:
 
             findings.append(BypassFinding(
                 rule_id="GHOST-WF-006",
-                rule_name="workflow_dispatch with write permissions",
+                rule_name="Manual workflow trigger with write permissions",
                 repo=gate.full_name,
                 gate_type=GateType.WORKFLOW,
-                severity=Severity.HIGH,
+                severity=Severity.MEDIUM,
                 confidence=Confidence.HIGH,
                 min_privilege=AttackerLevel.REPO_WRITE,
                 summary=(
@@ -720,13 +727,11 @@ def wf_006_dispatch_write(gate: GateModel) -> list[BypassFinding]:
                     f"{', '.join(dangerous_jobs)}."
                 ),
                 bypass_path=(
-                    f"1. Workflow '{wf.path}' triggers on workflow_dispatch\n"
-                    f"2. Jobs with write permissions: {', '.join(dangerous_jobs)}\n"
-                    f"3. Attacker with stolen PAT (repo scope) calls:\n"
-                    f"   POST /repos/{gate.full_name}/actions/workflows/"
-                    f"{wf.path.split('/')[-1]}/dispatches\n"
-                    f"4. Workflow executes with elevated GITHUB_TOKEN permissions\n"
-                    f"5. Attacker can modify contents, packages, or releases"
+                    f"Observed: workflow '{wf.path}' has workflow_dispatch\n"
+                    f"Observed: jobs with write permissions: {', '.join(dangerous_jobs)}\n"
+                    f"Prerequisite: a caller must be authorized to dispatch the workflow\n"
+                    f"Inference: the defined jobs then run with elevated token permissions\n"
+                    f"Potential consequence depends on the workflow's steps and inputs"
                 ),
                 evidence={
                     "workflow": wf.path,
@@ -734,7 +739,8 @@ def wf_006_dispatch_write(gate: GateModel) -> list[BypassFinding]:
                     "dangerous_jobs": dangerous_jobs,
                 },
                 gating_conditions=[
-                    "Attacker needs a PAT with repo scope or write access",
+                    "Caller needs repository write access or an equivalent authorized token",
+                    "Workflow steps or inputs must expose a security-sensitive effect",
                 ],
                 remediation=(
                     f"Restrict permissions on workflow_dispatch workflows to "
@@ -750,25 +756,22 @@ def wf_006_dispatch_write(gate: GateModel) -> list[BypassFinding]:
 
         findings.append(BypassFinding(
             rule_id="GHOST-WF-006",
-            rule_name="workflow_dispatch with write permissions",
+            rule_name="Manual workflow trigger with write permissions",
             repo=gate.full_name,
             gate_type=GateType.WORKFLOW,
-            severity=Severity.HIGH,
+            severity=Severity.MEDIUM,
             confidence=Confidence.HIGH,
             min_privilege=AttackerLevel.REPO_WRITE,
             summary=(
-                f"Workflow '{wf.name}' ({wf.path}) is remotely triggerable "
-                f"via workflow_dispatch with {perm_source} — stolen PAT = "
-                f"remote code execution."
+                f"Workflow '{wf.name}' ({wf.path}) has workflow_dispatch "
+                f"with {perm_source}."
             ),
             bypass_path=(
-                f"1. Workflow '{wf.path}' triggers on workflow_dispatch\n"
-                f"2. Permissions: {perm_source}\n"
-                f"3. Attacker with stolen PAT (repo scope) calls:\n"
-                f"   POST /repos/{gate.full_name}/actions/workflows/"
-                f"{wf.path.split('/')[-1]}/dispatches\n"
-                f"4. Workflow executes with write-all GITHUB_TOKEN\n"
-                f"5. Attacker can push code, delete releases, modify packages"
+                f"Observed: workflow '{wf.path}' has workflow_dispatch\n"
+                f"Observed permissions: {perm_source}\n"
+                f"Prerequisite: a caller must be authorized to dispatch the workflow\n"
+                f"Inference: the defined jobs run with write token permissions\n"
+                f"Potential consequence depends on the workflow's steps and inputs"
             ),
             evidence={
                 "workflow": wf.path,
@@ -777,7 +780,8 @@ def wf_006_dispatch_write(gate: GateModel) -> list[BypassFinding]:
                 "workflow_permissions": wf.permissions or "inherited",
             },
             gating_conditions=[
-                "Attacker needs a PAT with repo scope or write access",
+                "Caller needs repository write access or an equivalent authorized token",
+                "Workflow steps or inputs must expose a security-sensitive effect",
             ],
             remediation=(
                 f"Add explicit least-privilege permissions to '{wf.path}':\n"
@@ -802,6 +806,24 @@ def _has_dangerous_permissions(perms: dict) -> bool:
     return False
 
 
+def _environment_name(environment: str | dict | None) -> str | None:
+    """Extract the name from a workflow job environment value."""
+    if isinstance(environment, str):
+        return environment
+    if isinstance(environment, dict):
+        return environment.get("name")
+    return None
+
+
+def _reviewer_gated_environment_names(gate: GateModel) -> set[str]:
+    """Return only environments with an observed required reviewer."""
+    return {
+        environment.name
+        for environment in gate.environments
+        if environment.reviewers
+    }
+
+
 # ==================================================================
 # GHOST-WF-007: contents:write without environment gate
 # ==================================================================
@@ -814,25 +836,20 @@ def _has_dangerous_permissions(perms: dict) -> bool:
     tags=("workflow", "permissions", "contents", "release", "supply-chain"),
 )
 def wf_007_contents_write_no_env(gate: GateModel) -> list[BypassFinding]:
-    """Detects workflows with contents:write that lack environment gates.
+    """Detects contents:write without an observed reviewer-gated environment.
 
-    Impact: contents:write allows pushing commits, creating/deleting
-    releases, creating/deleting tags, and modifying repo contents.
-    Without an environment gate (required reviewers), any workflow
-    trigger can execute these destructive actions.
-
-    In the Trivy attack, contents:write enabled the attacker to delete
-    releases, rename the repo, and overwrite it with empty content.
-    An environment gate would have required human approval.
+    The permission is a capability. A harmful consequence additionally depends
+    on workflow behavior and attacker reachability.
     """
     findings: list[BypassFinding] = []
     default_is_write = (
         gate.workflow_permissions.default_workflow_permissions == "write"
     )
+    gated_environments = _reviewer_gated_environment_names(gate)
 
     for wf in gate.workflows:
         for job in wf.jobs:
-            has_env = bool(job.environment)
+            environment_name = _environment_name(job.environment)
             has_contents_write = False
             perm_source = ""
 
@@ -855,7 +872,7 @@ def wf_007_contents_write_no_env(gate: GateModel) -> list[BypassFinding]:
                     has_contents_write = True
                     perm_source = "inherited from org/repo default (write)"
 
-            if not has_contents_write or has_env:
+            if not has_contents_write or environment_name in gated_environments:
                 continue
 
             findings.append(BypassFinding(
@@ -868,26 +885,25 @@ def wf_007_contents_write_no_env(gate: GateModel) -> list[BypassFinding]:
                 min_privilege=AttackerLevel.REPO_WRITE,
                 summary=(
                     f"Job '{job.name}' in '{wf.path}' has contents:write "
-                    f"({perm_source}) without an environment gate — can "
-                    f"push commits, delete releases, modify tags."
+                    f"({perm_source}) without an observed reviewer-gated environment."
                 ),
                 bypass_path=(
-                    f"1. Workflow '{wf.path}' job '{job.name}'\n"
-                    f"2. Has {perm_source}\n"
-                    f"3. No environment gate (no required reviewers)\n"
-                    f"4. GITHUB_TOKEN can: push commits, create/delete releases, "
-                    f"create/delete tags, modify repo contents\n"
-                    f"5. If triggered by attacker (dispatch, compromised PR, "
-                    f"stolen PAT), all destructive actions execute without approval"
+                    f"Observed: workflow '{wf.path}' job '{job.name}' has {perm_source}\n"
+                    f"Observed: job environment {environment_name!r} has no collected "
+                    f"required reviewers\n"
+                    f"Inference: the job's token permits repository-content changes "
+                    f"without a reviewer approval step\n"
+                    f"Potential consequence depends on how the workflow uses that token"
                 ),
                 evidence={
                     "workflow": wf.path,
                     "job": job.name,
                     "permissions_source": perm_source,
-                    "environment": None,
+                    "environment": environment_name,
                 },
                 gating_conditions=[
                     "Attacker must be able to trigger the workflow",
+                    "Workflow steps must use the token for a security-sensitive write",
                 ],
                 remediation=(
                     f"Add a protected environment with required reviewers to "
@@ -917,9 +933,6 @@ _PUBLISH_ACTIONS = frozenset({
     "pypa/gh-action-pypi-publish",
     "JS-DevTools/npm-publish",
     "docker/build-push-action",
-    "docker/login-action",
-    "aws-actions/amazon-ecr-login",
-    "google-github-actions/setup-gcloud",
 })
 
 _PUBLISH_COMMANDS = (
@@ -946,23 +959,18 @@ _PUBLISH_COMMANDS = (
     tags=("workflow", "publish", "supply-chain", "registry"),
 )
 def wf_008_publish_no_env(gate: GateModel) -> list[BypassFinding]:
-    """Detects workflows that publish to package registries without
-    environment gates.
+    """Detects publish steps without an observed reviewer-gated environment.
 
-    Impact: Publishing to npm, PyPI, Docker Hub, VSIX, NuGet, or
-    creating GitHub releases without required reviewers means any
-    workflow trigger can push malicious artifacts. In the Trivy attack,
-    the attacker published a malicious VS Code extension to Open VSIX.
-
-    An environment gate with required reviewers would have blocked
-    the malicious publish.
+    Publishing behavior is observed, while malicious use still requires
+    attacker reachability and usable publish credentials.
     """
     findings: list[BypassFinding] = []
+    gated_environments = _reviewer_gated_environment_names(gate)
 
     for wf in gate.workflows:
         for job in wf.jobs:
-            has_env = bool(job.environment)
-            if has_env:
+            environment_name = _environment_name(job.environment)
+            if environment_name in gated_environments:
                 continue
 
             publish_evidence = _detect_publish_steps(job)
@@ -975,27 +983,28 @@ def wf_008_publish_no_env(gate: GateModel) -> list[BypassFinding]:
                 repo=gate.full_name,
                 gate_type=GateType.WORKFLOW,
                 severity=Severity.HIGH,
-                confidence=Confidence.HIGH,
+                confidence=Confidence.MEDIUM,
                 min_privilege=AttackerLevel.REPO_WRITE,
                 summary=(
-                    f"Job '{job.name}' in '{wf.path}' publishes to a package "
-                    f"registry or creates releases without an environment gate."
+                    f"Job '{job.name}' in '{wf.path}' contains a package/release publish "
+                    f"registry or creates releases without an observed "
+                    f"reviewer-gated environment."
                 ),
                 bypass_path=(
-                    f"1. Workflow '{wf.path}' job '{job.name}'\n"
-                    f"2. Publish actions detected:\n"
+                    f"Observed: workflow '{wf.path}' job '{job.name}' has publish steps:\n"
                     + "\n".join(
                         f"   - {p}" for p in publish_evidence[:5]
                     )
-                    + f"\n3. No environment gate (no required reviewers)\n"
-                    f"4. Attacker who triggers workflow can publish malicious "
-                    f"artifacts to downstream consumers"
+                    + f"\nObserved: job environment {environment_name!r} has no "
+                    f"collected required reviewers\n"
+                    f"Potential consequence: a reachable workflow with usable credentials "
+                    f"could publish without reviewer approval"
                 ),
                 evidence={
                     "workflow": wf.path,
                     "job": job.name,
                     "publish_steps": publish_evidence[:5],
-                    "environment": None,
+                    "environment": environment_name,
                 },
                 gating_conditions=[
                     "Attacker must be able to trigger the workflow",
@@ -1025,6 +1034,11 @@ def _detect_publish_steps(job: WorkflowJob) -> list[str]:
         if step.uses:
             action_name = step.uses.split("@")[0]
             if action_name in _PUBLISH_ACTIONS:
+                if (
+                    action_name == "docker/build-push-action"
+                    and str(step.with_.get("push", "")).lower() not in ("true", "1")
+                ):
+                    continue
                 evidence.append(f"uses: {step.uses}")
 
         # Check run commands

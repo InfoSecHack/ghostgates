@@ -25,22 +25,3 @@ MAX_CONCURRENT_DEFAULT: int = 10
 # ---------------------------------------------------------------------------
 
 ORG_NAME_PATTERN: re.Pattern[str] = re.compile(r"^[a-zA-Z0-9._-]+$")
-
-# ---------------------------------------------------------------------------
-# Branch targeting
-# ---------------------------------------------------------------------------
-
-DEFAULT_BRANCHES_TO_CHECK: list[str] = [
-    "main",
-    "master",
-    "develop",
-    "staging",
-    "production",
-]
-
-DEPLOY_BRANCH_PATTERNS: list[str] = [
-    "release/*",
-    "deploy/*",
-    "staging",
-    "production",
-]

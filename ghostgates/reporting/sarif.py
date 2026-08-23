@@ -1,9 +1,8 @@
 """
 ghostgates/reporting/sarif.py
 
-SARIF 2.1.0 output formatter. Produces Static Analysis Results
-Interchange Format for integration with GitHub Code Scanning,
-Azure DevOps, and other SARIF consumers.
+SARIF 2.1.0 output formatter for GitHub Code Scanning and compatible
+consumers.
 
 Usage:
     ghostgates scan --org my-org --format sarif > results.sarif
@@ -33,13 +32,14 @@ _SEVERITY_TO_LEVEL: dict[Severity, str] = {
     Severity.INFO: "note",
 }
 
-# Map GhostGates severity → SARIF security-severity score (0-10)
-_SEVERITY_TO_SCORE: dict[Severity, float] = {
-    Severity.CRITICAL: 9.5,
-    Severity.HIGH: 7.5,
-    Severity.MEDIUM: 5.0,
-    Severity.LOW: 3.0,
-    Severity.INFO: 1.0,
+# GitHub documents security-severity as a 0.0–10.0 string. These are category
+# representatives for display/ranking, not calculated CVSS scores.
+_SECURITY_SEVERITY: dict[Severity, str] = {
+    Severity.CRITICAL: "9.1",
+    Severity.HIGH: "7.0",
+    Severity.MEDIUM: "4.0",
+    Severity.LOW: "0.1",
+    Severity.INFO: "0.0",
 }
 
 
@@ -62,9 +62,10 @@ def _build_rule(finding: BypassFinding) -> dict[str, Any]:
             "level": _SEVERITY_TO_LEVEL[finding.severity],
         },
         "properties": {
-            "security-severity": str(_SEVERITY_TO_SCORE[finding.severity]),
             "tags": ["security", "cicd", finding.gate_type.value],
             "precision": "high" if finding.confidence.value == "high" else "medium",
+            "security-severity": _SECURITY_SEVERITY[finding.severity],
+            "ghostgates/severity-mapping": "qualitative-category",
         },
     }
     if finding.references:
@@ -124,8 +125,6 @@ def _build_location(finding: BypassFinding) -> dict[str, Any]:
 
 def _build_result(finding: BypassFinding, rule_index: int) -> dict[str, Any]:
     """Build a SARIF result from a finding."""
-    instance_tag = f" ({finding.instance})" if finding.instance else ""
-
     result: dict[str, Any] = {
         "ruleId": finding.rule_id,
         "ruleIndex": rule_index,
@@ -152,16 +151,6 @@ def _build_result(finding: BypassFinding, rule_index: int) -> dict[str, Any]:
 
     if finding.settings_url:
         result["properties"]["settings_url"] = finding.settings_url
-
-    # Add fix suggestion if we have a settings URL
-    if finding.settings_url:
-        result["fixes"] = [
-            {
-                "description": {
-                    "text": finding.remediation.split("\n")[0],
-                },
-            },
-        ]
 
     return result
 
@@ -197,6 +186,15 @@ def format_sarif(result: ScanResult) -> str:
                 "results": results,
                 "automationDetails": {
                     "id": f"ghostgates/{result.org}/{result.collected_at}",
+                },
+                "invocations": [
+                    {
+                        "executionSuccessful": result.is_complete,
+                    },
+                ],
+                "properties": {
+                    "ghostgates/complete": result.is_complete,
+                    "ghostgates/collectionErrors": result.error_messages,
                 },
             },
         ],

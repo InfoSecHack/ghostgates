@@ -1,11 +1,11 @@
 """
 ghostgates/engine/rules/branch_protection.py
 
-Branch protection bypass rules (GHOST-BP-001 through GHOST-BP-006).
+Branch and ruleset checks (GHOST-BP-001–003 and GHOST-BP-005–006).
 
-Each rule checks for a specific structural bypass in branch protection
-configuration. Rules only fire when the gate model shows the bypass
-is actually present — no guessing.
+Each rule records an observed configuration and a conditional security
+inference. Findings do not demonstrate that the prerequisite actors or
+downstream behavior exist.
 """
 
 from __future__ import annotations
@@ -34,14 +34,7 @@ from ghostgates.models.findings import BypassFinding
     tags=("branch-protection", "review-bypass"),
 )
 def bp_001_admin_bypass_reviews(gate: GateModel) -> list[BypassFinding]:
-    """Detects branches where required reviews exist but enforce_admins is disabled.
-
-    Impact: A repo admin can push directly to the protected branch,
-    bypassing all required review checks.
-
-    This is the single most common branch protection misconfiguration.
-    GitHub defaults enforce_admins to False when creating protections.
-    """
+    """Detect branches where required reviews do not apply to administrators."""
     findings: list[BypassFinding] = []
 
     for bp in gate.branch_protections:
@@ -99,15 +92,7 @@ def bp_001_admin_bypass_reviews(gate: GateModel) -> list[BypassFinding]:
     tags=("branch-protection", "review-bypass"),
 )
 def bp_002_stale_reviews(gate: GateModel) -> list[BypassFinding]:
-    """Detects branches where reviews are required but stale approvals persist.
-
-    Impact: An attacker with write access can:
-      1. Submit a benign PR, get it approved
-      2. Push malicious commits after approval
-      3. Merge with the stale approval still valid
-
-    This is the classic "bait-and-switch" PR attack.
-    """
+    """Detect branches where new commits do not dismiss existing approvals."""
     findings: list[BypassFinding] = []
 
     for bp in gate.branch_protections:
@@ -168,13 +153,8 @@ def bp_002_stale_reviews(gate: GateModel) -> list[BypassFinding]:
 def bp_003_no_codeowners(gate: GateModel) -> list[BypassFinding]:
     """Detects branches where reviews are required but CODEOWNERS review is not.
 
-    Impact: Any authorized reviewer can approve changes to any file,
-    even files that CODEOWNERS designates to a specific team. This
-    means a friendly reviewer outside the owning team can approve
-    changes to sensitive paths (deploy configs, CI, infra).
-
-    Only fires when reviews are required (>0) because CODEOWNERS
-    enforcement without required reviews is meaningless.
+    A security consequence exists only if CODEOWNERS is present and an
+    otherwise eligible reviewer approves a change outside their ownership area.
     """
     findings: list[BypassFinding] = []
 
@@ -190,16 +170,15 @@ def bp_003_no_codeowners(gate: GateModel) -> list[BypassFinding]:
                 min_privilege=AttackerLevel.REPO_WRITE,
                 summary=(
                     f"Branch '{bp.branch}' requires {bp.required_approving_review_count} "
-                    f"review(s) but does not require CODEOWNERS approval — any reviewer "
-                    f"can approve changes to any file."
+                    f"review(s) but does not require approval from code owners."
                 ),
                 bypass_path=(
-                    f"1. Attacker submits PR modifying sensitive files "
-                    f"(deploy configs, CI workflows, infra code)\n"
-                    f"2. CODEOWNERS file designates a specific team for these paths\n"
-                    f"3. require_code_owner_reviews is False\n"
-                    f"4. Any collaborator with write access can approve the PR\n"
-                    f"5. Changes to sensitive files merge without domain owner review"
+                    f"Observed: branch '{bp.branch}' requires reviews but "
+                    f"require_code_owner_reviews is false\n"
+                    f"Unobserved prerequisite: CODEOWNERS assigns the changed path and "
+                    f"an eligible non-owner reviewer approves the pull request\n"
+                    f"Potential consequence: the change can satisfy the collected review "
+                    f"setting without code-owner approval"
                 ),
                 evidence={
                     "branch": bp.branch,
@@ -223,157 +202,21 @@ def bp_003_no_codeowners(gate: GateModel) -> list[BypassFinding]:
 
 
 # ==================================================================
-# GHOST-BP-004: Default branch protected but deploy branches not
-# ==================================================================
-
-@registry.rule(
-    rule_id="GHOST-BP-004",
-    name="Deployment branches lack protection",
-    gate_type=GateType.BRANCH_PROTECTION,
-    min_privilege=AttackerLevel.REPO_WRITE,
-    tags=("branch-protection", "deployment"),
-)
-def bp_004_unprotected_deploy_branches(gate: GateModel) -> list[BypassFinding]:
-    """Detects when the default branch is protected but deployment-related
-    branches are not.
-
-    Impact: If deployment workflows trigger on branches like release/*,
-    deploy/*, staging, or production, an attacker with write access can
-    push directly to those branches, triggering deployments without review.
-
-    This rule checks if the default branch has protection while known
-    deployment branch patterns are missing from branch_protections.
-    """
-    findings: list[BypassFinding] = []
-
-    # Find default branch protection
-    default_bp = None
-    for bp in gate.branch_protections:
-        if bp.branch == gate.default_branch:
-            default_bp = bp
-            break
-
-    if default_bp is None:
-        return []  # No default branch protection — separate concern
-
-    if default_bp.required_approving_review_count == 0:
-        return []  # Default branch has no review requirement — not a gap
-
-    # Check which deployment-relevant branches lack protection
-    protected_branches = {bp.branch for bp in gate.branch_protections}
-
-    # Check for environments that reference specific branches
-    deploy_branches = _detect_deploy_branches(gate)
-
-    unprotected = [b for b in deploy_branches if b not in protected_branches]
-
-    if unprotected:
-        findings.append(BypassFinding(
-            rule_id="GHOST-BP-004",
-            rule_name="Deployment branches lack protection",
-            repo=gate.full_name,
-            gate_type=GateType.BRANCH_PROTECTION,
-            severity=Severity.MEDIUM,
-            confidence=Confidence.MEDIUM,
-            min_privilege=AttackerLevel.REPO_WRITE,
-            summary=(
-                f"Default branch '{gate.default_branch}' is protected with "
-                f"{default_bp.required_approving_review_count} required review(s), "
-                f"but deployment-related branches are unprotected: "
-                f"{', '.join(unprotected)}"
-            ),
-            bypass_path=(
-                f"1. Default branch '{gate.default_branch}' requires "
-                f"{default_bp.required_approving_review_count} review(s)\n"
-                f"2. Deployment-related branches lack protection: {', '.join(unprotected)}\n"
-                f"3. Attacker pushes directly to an unprotected deployment branch\n"
-                f"4. Deployment workflows triggered by push to these branches execute "
-                f"without review"
-            ),
-            evidence={
-                "default_branch": gate.default_branch,
-                "default_branch_reviews": default_bp.required_approving_review_count,
-                "protected_branches": sorted(protected_branches),
-                "unprotected_deploy_branches": sorted(unprotected),
-            },
-            gating_conditions=[
-                "Attacker must have write access to push to unprotected branches",
-                "Deployment workflows must trigger on the unprotected branches",
-            ],
-            remediation=(
-                f"Apply branch protection rules to deployment-related branches: "
-                f"{', '.join(unprotected)}. At minimum, require the same number of "
-                f"reviews as the default branch.\n"
-                f"→ {branches_url(gate.full_name)}"
-            ),
-            settings_url=branches_url(gate.full_name),
-        ))
-
-    return findings
-
-
-def _detect_deploy_branches(gate: GateModel) -> list[str]:
-    """Detect branches that are likely deployment targets.
-
-    Sources:
-      1. Environment deployment branch policies
-      2. Workflow trigger branches that target environment jobs
-      3. Well-known deployment branch names
-    """
-    branches: set[str] = set()
-
-    # Check environments for deployment branch references
-    for env in gate.environments:
-        policy = env.deployment_branch_policy
-        if policy.type == "selected" and policy.patterns:
-            for pattern in policy.patterns:
-                # Only add concrete branch names, not wildcards
-                if "*" not in pattern and "?" not in pattern:
-                    branches.add(pattern)
-
-    # Check workflows for deployment-like jobs with branch triggers
-    for wf in gate.workflows:
-        has_deploy_job = any(
-            j.environment is not None for j in wf.jobs
-        )
-        if has_deploy_job:
-            for trigger in wf.triggers:
-                if trigger.event in ("push", "pull_request"):
-                    for b in trigger.branches:
-                        if b != gate.default_branch and "*" not in b:
-                            branches.add(b)
-
-    # Always check well-known deployment branches
-    well_known = {"staging", "production", "release", "deploy"}
-    branches.update(well_known)
-
-    # Remove the default branch (it's already protected)
-    branches.discard(gate.default_branch)
-
-    return sorted(branches)
-
-
-# ==================================================================
 # GHOST-BP-005: Workflows can approve own PRs
 # ==================================================================
 
 @registry.rule(
     rule_id="GHOST-BP-005",
-    name="Workflows can approve their own PRs",
+    name="Actions pull-request approval setting enabled",
     gate_type=GateType.BRANCH_PROTECTION,
     min_privilege=AttackerLevel.REPO_WRITE,
     tags=("branch-protection", "review-bypass", "actions"),
 )
 def bp_005_workflow_self_approve(gate: GateModel) -> list[BypassFinding]:
-    """Detects when GitHub Actions workflows can approve PRs they create.
+    """Flag an approval capability that can weaken review separation.
 
-    Impact: If can_approve_pull_request_reviews is enabled at the
-    org or repo level, a workflow with write permissions to pull-requests
-    can approve its own PRs. Combined with auto-merge, this allows
-    fully automated code changes without human review.
-
-    This is dangerous when workflows are triggered by external events
-    (e.g., dependabot, renovate, or attacker-controlled workflow_dispatch).
+    The setting alone does not prove that a workflow has pull-requests:write,
+    performs an approval, or can merge a change. Those remain prerequisites.
     """
     findings: list[BypassFinding] = []
 
@@ -393,23 +236,23 @@ def bp_005_workflow_self_approve(gate: GateModel) -> list[BypassFinding]:
 
     findings.append(BypassFinding(
         rule_id="GHOST-BP-005",
-        rule_name="Workflows can approve their own PRs",
+        rule_name="Actions pull-request approval setting enabled",
         repo=gate.full_name,
         gate_type=GateType.BRANCH_PROTECTION,
-        severity=Severity.HIGH,
-        confidence=Confidence.HIGH,
+        severity=Severity.MEDIUM,
+        confidence=Confidence.MEDIUM,
         min_privilege=AttackerLevel.REPO_WRITE,
         summary=(
-            f"can_approve_pull_request_reviews is enabled — GitHub Actions "
-            f"workflows can approve PRs targeting protected branches ({branch_list})."
+            f"can_approve_pull_request_reviews is enabled while protected branches "
+            f"require reviews ({branch_list}); review workflow permissions and behavior."
         ),
         bypass_path=(
-            f"1. can_approve_pull_request_reviews is enabled for {gate.full_name}\n"
-            f"2. Protected branches require reviews: {branch_list}\n"
-            f"3. If any workflow with pull-requests: write is attacker-triggerable "
-            f"(push, PR, workflow_dispatch, or reusable workflow call), "
-            f"it can approve PRs to protected branches\n"
-            f"4. Combined with auto-merge, code changes merge without human review"
+            f"Observed: can_approve_pull_request_reviews is enabled for {gate.full_name}\n"
+            f"Observed: protected branches require reviews: {branch_list}\n"
+            f"Inference: a workflow could approve a pull request only if it also has "
+            f"pull-requests: write and executes an approval action\n"
+            f"Potential consequence: automated approval may weaken the intended "
+            f"human-review gate"
         ),
         evidence={
             "can_approve_pull_request_reviews": True,
@@ -450,20 +293,8 @@ def bp_005_workflow_self_approve(gate: GateModel) -> list[BypassFinding]:
     tags=("ruleset", "false-enforcement"),
 )
 def bp_006_evaluate_mode_ruleset(gate: GateModel) -> list[BypassFinding]:
-    """Detects rulesets in "evaluate" mode that appear to protect branches
-    but don't actually enforce anything.
-
-    Impact: Rulesets in evaluate mode log violations but do NOT block
-    pushes or merges. Organizations may believe a ruleset is protecting
-    a branch when it's only auditing. This creates a false sense of
-    security.
-
-    This is particularly dangerous when evaluate mode rulesets are the
-    ONLY protection on a branch (no branch protection rules either).
-    """
+    """Detect rulesets configured to evaluate rather than enforce their rules."""
     findings: list[BypassFinding] = []
-
-    protected_branches = {bp.branch for bp in gate.branch_protections}
 
     for rs in gate.rulesets:
         if rs.enforcement != "evaluate":
@@ -472,10 +303,6 @@ def bp_006_evaluate_mode_ruleset(gate: GateModel) -> list[BypassFinding]:
         # Determine which branches this ruleset targets
         target_branches = _ruleset_target_branches(rs, gate.default_branch)
 
-        # Higher severity if this is the only "protection" on the branch
-        has_real_protection = any(b in protected_branches for b in target_branches)
-        severity = Severity.MEDIUM if has_real_protection else Severity.HIGH
-
         branch_desc = ", ".join(target_branches) if target_branches else "configured branches"
 
         findings.append(BypassFinding(
@@ -483,39 +310,35 @@ def bp_006_evaluate_mode_ruleset(gate: GateModel) -> list[BypassFinding]:
             rule_name="Ruleset in evaluate mode (not enforced)",
             repo=gate.full_name,
             gate_type=GateType.RULESET,
-            severity=severity,
+            severity=Severity.MEDIUM,
             confidence=Confidence.HIGH,
             min_privilege=AttackerLevel.REPO_WRITE,
             summary=(
-                f"Ruleset '{rs.name}' is in evaluate mode — it logs violations "
-                f"but does not enforce rules on {branch_desc}."
+                f"Ruleset '{rs.name}' is in evaluate mode, so this ruleset does "
+                f"not enforce its configured rules on {branch_desc}."
             ),
             bypass_path=(
-                f"1. Ruleset '{rs.name}' targets {branch_desc}\n"
-                f"2. Enforcement mode is 'evaluate' (audit only)\n"
-                f"3. Pushes and merges that violate the ruleset are logged but NOT blocked\n"
-                f"4. Attacker pushes directly or merges PRs that violate ruleset rules"
-                + (
-                    f"\n5. No other branch protection exists for these branches — "
-                    f"ruleset is the only 'protection'"
-                    if not has_real_protection else ""
-                )
+                f"Observed: ruleset '{rs.name}' targets {branch_desc}\n"
+                f"Observed: enforcement mode is 'evaluate'\n"
+                f"Inference: an operation that violates these rules is not blocked by "
+                f"this ruleset\n"
+                f"Unobserved prerequisite: no other branch protection or active ruleset "
+                f"blocks the operation"
             ),
             evidence={
                 "ruleset_name": rs.name,
                 "ruleset_id": rs.id,
                 "enforcement": rs.enforcement,
                 "target_branches": target_branches,
-                "has_branch_protection": has_real_protection,
                 "rules": [r.get("type", "unknown") for r in rs.rules],
             },
             gating_conditions=[
                 "Attacker must have write access to push or merge",
+                "Other collected or uncollected controls must not block the operation",
             ],
             remediation=(
                 f"Change ruleset '{rs.name}' enforcement from 'evaluate' to 'active'. "
-                f"If evaluate mode is intentional for testing, ensure branch protection "
-                f"rules are also in place as a backstop.\n"
+                f"If evaluate mode is intentional, verify that other required controls enforce the policy.\n"
                 f"→ {rulesets_url(gate.full_name)}"
             ),
             settings_url=rulesets_url(gate.full_name),

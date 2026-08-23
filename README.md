@@ -1,783 +1,200 @@
 # GhostGates
 
-![License](https://img.shields.io/badge/license-MIT-blue)
-![Python](https://img.shields.io/badge/python-3.11%2B-blue)
-![Status](https://img.shields.io/badge/status-beta-orange)
+> An AI-assisted research prototype for exploring how GitHub workflow, branch/ruleset, environment, permission, and OIDC controls compose into security gates and potential bypass paths.
 
-GhostGates is a CI/CD security analysis tool that identifies **structural bypass paths** in GitHub Actions workflows, branch protections, environments, rulesets, and OIDC trust policies.
+GhostGates collects selected GitHub configuration, combines it with an attacker-prerequisite model, and emits findings about security consequences that may follow when controls interact. Its narrow differentiator is cross-control composition plus explicit attacker prerequisites and gate-bypass reasoning.
 
-Traditional CI/CD scanners detect **misconfigurations**. GhostGates models **how controls interact** to uncover attack paths that allow bypassing those controls without violating any technical policy.
+This is a learning and research artifact. It is not production-ready, a complete GitHub security assessment, or proof that a reported path is exploitable.
 
-![GhostGates scan output showing CI/CD gate bypass findings](docs/screenshot.png)
+## Reasoning model
 
-*Example terminal output from a GhostGates scan.*
+GhostGates follows this model:
 
-## Features
+~~~
+observed GitHub configuration
+        + attacker prerequisite
+        + interacting controls
+        -> inferred potential gate-bypass path
+~~~
 
-- Structural CI/CD gate bypass detection (not just misconfiguration scanning)
-- Attacker capability threat modeling with minimum privilege levels
-- Risk ranking across repositories
-- Policy-as-code compliance auditing
-- Red team attack surface recon
-- Kill chain graph visualization (Mermaid)
-- SARIF output for GitHub Code Scanning
+The distinction between those terms matters:
 
----
+| Term | Meaning in GhostGates |
+|---|---|
+| Observed configuration | Data returned by the GitHub API or parsed from workflow YAML. |
+| Attacker prerequisite | The minimum target-repository access assumed by a finding. It is an input to the inference, not an observation about a real attacker. |
+| Inferred consequence | A rule-derived security outcome that still depends on stated and sometimes unobserved conditions. |
+| Demonstrated by tests | Behavior exercised with synthetic models and mocked HTTP responses. |
+| Validated against GitHub | Not established by the repository's current test evidence. |
+| Not validated | Runtime exploitability, cloud-role assumption, action behavior, and the completeness of GitHub API coverage. |
 
-## Table of Contents
+A green test suite demonstrates that the implementation behaves as its tests specify. It does not independently validate GitHub's current behavior, a cloud trust policy, or an end-to-end exploit.
 
-- [Why GhostGates Exists](#why-ghostgates-exists)
-- [Quick Start](#quick-start)
-- [Example Output](#example-output)
-- [Example Finding](#example-finding)
-- [What GhostGates Detects](#what-ghostgates-detects)
-- [Threat Model](#threat-model)
-- [Installation](#installation)
-- [Usage](#usage)
-- [Risk Ranking](#risk-ranking)
-- [Policy Audit](#policy-audit)
-- [Recon (Attack Surface)](#recon-attack-surface)
-- [Kill Chain (Graph)](#kill-chain-graph)
-- [Output Formats](#output-formats)
-- [GitHub Action](#github-action)
-- [Token Permissions](#token-permissions)
-- [Rule Catalog](#rule-catalog-19-rules)
-- [Architecture](#architecture)
-- [Development](#development)
-- [Adding New Rules](#adding-new-rules)
-- [How GhostGates Compares](#how-ghostgates-compares)
-- [Roadmap](#roadmap)
-- [License](#license)
+## What is collected
 
----
+For active, in-scope repositories, the collector models:
 
-## Why GhostGates Exists
+- repository identity, visibility, fork state, and default branch;
+- classic branch protection for the default branch;
+- repository rulesets returned by GitHub;
+- environments, required reviewers, wait timers, and deployment branch policies;
+- workflow YAML, triggers, jobs, steps, environments, permissions, and reusable-workflow references;
+- organization and repository Actions permission settings; and
+- the organization OIDC subject customization template.
 
-Organizations spend real effort configuring CI/CD security gates — required reviewers, branch protections, environment approvals, OIDC trust policies. Once configured, these controls are treated as enforced.
+GhostGates does not enumerate all branches or cloud IAM configuration. It does not fetch secret values, execute workflows or actions, attempt bypasses, or prove that an inferred consequence is reachable.
 
-They often aren't.
+## Quick start
 
-The problem isn't misconfiguration. It's that **controls interact in ways that create structural bypass paths** — gaps where an attacker at a given privilege level can circumvent a gate entirely without violating any technical policy. The gate appears enforced. The bypass works anyway.
+Python 3.11 or newer is required.
 
-Real examples:
+~~~
+python -m venv .venv
+# Activate the environment using the command for your shell.
+python -m pip install -e ".[dev]"
+python -m pytest -q
+~~~
 
-- A workflow using `pull_request_target` that checks out PR head code gives any external attacker privileged execution — no credentials required
-- Branch protections with `enforce_admins` disabled make required reviews purely cosmetic for anyone with repo-admin access
-- OIDC trust policies configured without an environment gate allow deployments from any branch in the repo
-- Rulesets in evaluate mode log violations but block nothing — they look enforced in the UI
+Set a GitHub token in the environment, then limit an initial scan to a repository you control:
 
-Traditional scanners flag the misconfiguration. GhostGates finds the bypass path.
+~~~
+export GITHUB_TOKEN=...
+ghostgates scan --org example-org --repos example-repo --attacker repo-write -v
+~~~
 
-It models **how controls interact**, maps the gap between configured and actually enforced, and shows the exact attack steps needed to exploit it.
+Token permissions and organization policy determine which endpoints can be collected. Collection errors should be reviewed; missing data is not evidence that a control is absent.
 
----
+Useful commands:
 
-## Quick Start
-
-```bash
-git clone https://github.com/InfoSecHack/ghostgates
-cd ghostgates
-pip install -e .
-export GITHUB_TOKEN=ghp_your_token_here
-ghostgates scan --org my-org
-```
-
----
-
-## Example Output
-
-### Risk Ranking
-
-```
-╔══════════════════════════════════════════════════════╗
-║  GhostGates Risk Ranking                             ║
-╚══════════════════════════════════════════════════════╝
-
-  Organization:  my-org
-  Repos ranked:  3
-
-    #  Repository                    Score   Tier       Findings     Flags
-  ─────────────────────────────────────────────────────────────────────────
-    1  my-org/payments-api            282    CRITICAL   1C 10H 7M 1L  ⚠ external  ⚠ OIDC  ⚠ prod
-    2  my-org/web-app                  47    HIGH       2H 1M
-    3  my-org/docs                      2    LOW        1L
-
-  Total risk: 331 across 3 repos
-  1 CRITICAL-tier repos
-```
-
-### Policy Audit
-
-```
-╔══════════════════════════════════════════════════════╗
-║  GhostGates Policy Audit                             ║
-╚══════════════════════════════════════════════════════╝
-
-  Policy:      ghostgates-policy.yml
-  Repos:       47 in scope (3 excluded)
-  Compliant:   31/47 (66%)
-  Total gaps:  14
-
-  ── Policy Gaps ──
-
-  my-org/payments-api    3 gaps
-    ✗ 🔒 enforce_admins: false (expected: true) [main]
-    ✗ ⚙️ max_default_permissions: write (expected: read)
-    ✗ 🔑 require_environment_claim: missing
-
-  ── Compliant ──
-    ✓ 31 repos fully compliant
-```
-
-### Attack Surface (Recon)
-
-```
-╔══════════════════════════════════════════════════════╗
-║  GhostGates Attack Surface                           ║
-╚══════════════════════════════════════════════════════╝
-
-  ── Attacker-Controlled Workflow Execution ──  (requires: NO CREDS)
-
-    my-org/payments-api
-      → PR head checkout in pr_target_unsafe.yml  (GHOST-WF-001)
-
-  ── Secrets Exposure ──  (requires: NO CREDS)
-
-    my-org/payments-api
-      → secrets: inherit → deploy.yml (deploy_unsafe.yml)  (GHOST-WF-003)
-
-  ── Cloud Credential Theft (OIDC) ──  (requires: repo-write)
-
-    my-org/payments-api
-      → id-token: write without env gate (oidc_deploy.yml#deploy-aws)  (GHOST-OIDC-002)
-```
-
----
-
-## Example Finding
-
-> **Note:** Simplified for readability. Actual terminal output formatting may differ.
-
-```
-[CRITICAL] GHOST-WF-001
-Rule:      pull_request_target + PR head checkout (supply chain attack)
-Workflow:  .github/workflows/pr_target_unsafe.yml
-Attacker:  external (no credentials required)
-
-Bypass Path:
-  1. Workflow triggers on pull_request_target
-  2. Job checks out the PR head branch:
-       uses: actions/checkout@v3
-       with:
-         ref: ${{ github.event.pull_request.head.sha }}
-  3. pull_request_target executes with BASE branch privileges
-     and write-scoped GITHUB_TOKEN — not the fork's read-only token
-  4. External attacker forks the repo and opens a PR with malicious code
-  5. Malicious code runs in the privileged workflow context
-
-Evidence:
-  trigger:     pull_request_target
-  head_ref:    github.event.pull_request.head.sha
-  permissions: write
-
-Impact:
-  Full code execution in a privileged workflow context.
-  Attacker can exfiltrate secrets, push commits, or poison
-  build artifacts — from a fork PR with no write access.
-
-Remediation:
-  Replace pull_request_target with pull_request, or restructure
-  the workflow to never check out untrusted PR head code in a
-  privileged context. If pull_request_target is required, perform
-  all untrusted code execution in a separate unprivileged job.
-```
-
----
-
-## What GhostGates Detects
-
-Each finding includes:
-
-- **Bypass path** — numbered attack steps showing exactly how the gate is bypassed
-- **Evidence** — raw configuration values proving the bypass exists
-- **Attacker level** — minimum privilege needed (external → org-owner)
-- **Remediation** — specific fix with configuration guidance and direct settings URL
-- **Instance key** — unique identifier (rule + repo + context) for stable tracking across scans
-
----
-
-## Threat Model
-
-GhostGates evaluates CI/CD security across a spectrum of attacker capability levels. Every rule specifies the **minimum privilege required** to exploit the bypass — so findings are scoped to what's actually reachable by a given attacker, not just theoretical worst-case.
-
-| Attacker Level | Access | Typical Vector |
-|----------------|--------|----------------|
-| `external` | None — public repo only | Fork PR, open issue |
-| `org-member` | Member of the GitHub organization | Internal PRs, org-level runners |
-| `repo-write` | Can push branches and open PRs | Branch push, PR creation |
-| `repo-maintain` | Can manage some branch protections | Protection overrides |
-| `repo-admin` | Repository administrator | Settings, branch protection overrides |
-| `org-owner` | Organization owner | Full org control |
-
-This model matters because the blast radius of a bypass depends entirely on who can trigger it. A CRITICAL finding exploitable by `external` attackers — like GHOST-WF-001 — is a different class of risk than a HIGH finding that requires `repo-admin`.
-
----
-
-## Installation
-
-```bash
-pip install -e ".[dev]"
-```
-
-Requires Python 3.11+.
-
----
-
-## Usage
-
-### Authentication
-
-Set your GitHub token as an environment variable (recommended):
-
-```bash
-export GITHUB_TOKEN=ghp_your_token_here
-```
-
-Or pass it directly (not recommended — appears in shell history):
-
-```bash
-ghostgates scan --org my-org --token ghp_xxx
-```
-
-### Live Scan
-
-```bash
-# Scan all repos in an org
-ghostgates scan --org my-org
-
-# Scan specific repos with verbose output
-ghostgates scan --org my-org --repos api,web -v
-
-# Scan with risk ranking appended
-ghostgates scan --org my-org --rank
-
-# JSON output for CI integration
-ghostgates scan --org my-org --format json > report.json
-
-# SARIF output for GitHub Code Scanning
-ghostgates scan --org my-org --format sarif > results.sarif
-
-# Markdown report
-ghostgates scan --org my-org --format md -o report.md
-
-# Simulate specific attacker level
-ghostgates scan --org my-org --attacker repo-write
-```
-
-### Offline Analysis
-
-After a scan, gate models are stored locally. Re-run analysis without API calls:
-
-```bash
-ghostgates offline --org my-org --db ghostgates.db
-ghostgates offline --org my-org --db ghostgates.db --attacker repo-admin --format json
-```
-
-### List Rules
-
-```bash
+~~~
 ghostgates list-rules
-ghostgates list-rules --format json
-```
-
-### Show Stored Results
-
-```bash
-ghostgates show --org my-org
-ghostgates show --org my-org --scan-id 3 --format md
-```
-
-### Drift Detection
-
-Detect new bypasses introduced between scans:
-
-```bash
-# Compare latest scan to previous scan
-ghostgates diff --org my-org
-
-# JSON output for CI integration
-ghostgates diff --org my-org --format json
-
-# Compare specific scan IDs
-ghostgates diff --org my-org --old-id 3 --new-id 5
-```
-
-### Exit Codes
-
-**scan / offline:**
-
-| Code | Meaning |
-|------|---------|
-| `0` | No findings (or LOW/INFO only) |
-| `1` | MEDIUM severity findings |
-| `2` | HIGH or CRITICAL findings |
-
-**diff:**
-
-| Code | Meaning |
-|------|---------|
-| `0` | No new findings since last scan |
-| `1` | New findings introduced |
-
-**audit:**
-
-| Code | Meaning |
-|------|---------|
-| `0` | All repos compliant |
-| `1` | Policy gaps found |
-
-Designed for CI/CD pipeline integration — fail the build when critical bypasses exist or policy gaps are detected.
-
----
-
-## Risk Ranking
-
-Aggregate findings per repo into weighted risk scores for prioritization. Addresses the "wall of findings" problem on large orgs.
-
-```bash
-# Standalone (uses latest stored scan)
-ghostgates rank --org my-org
-ghostgates rank --org my-org --format json
-ghostgates rank --org my-org --top 10
-
-# Appended to scan output
-ghostgates scan --org my-org --rank
-```
-
-**Scoring algorithm:**
-
-Each finding contributes a base score by severity: CRITICAL (50), HIGH (20), MEDIUM (7), LOW (2), INFO (0). Bonus points are added for structural risk factors:
-
-- **+25** if any finding is reachable by an external attacker (no credentials)
-- **+15** if any OIDC finding exists (cloud credential risk)
-- **+10** if a production environment is involved
-
-Repos are tiered: CRITICAL (≥75), HIGH (≥40), MEDIUM (≥15), LOW (<15).
-
----
-
-## Policy Audit
-
-Define your organization's security standard in a YAML file, then measure compliance across every repo. This is the feature that produces SOC2 evidence, ISO 27001 audit artifacts, and board-level compliance percentages.
-
-Rare among open-source CI/CD tools, which typically check only generic best-practice configurations. GhostGates audit checks YOUR policy.
-
-```bash
-# Live scan + audit
-ghostgates audit --org my-org --policy ghostgates-policy.yml
-
-# Audit against stored data (no API calls)
-ghostgates audit --org my-org --policy ghostgates-policy.yml --offline
-
-# JSON for CI pipelines
-ghostgates audit --org my-org --policy ghostgates-policy.yml --format json
-
-# Markdown for reports
-ghostgates audit --org my-org --policy ghostgates-policy.yml --format md -o audit.md
-```
-
-### Policy File Format
-
-Copy `ghostgates-policy.example.yml` and customize for your org. Only fields you explicitly set are enforced:
-
-```yaml
-# ghostgates-policy.yml
-policy:
-  branch_protection:
-    enforce_admins: true
-    dismiss_stale_reviews: true
-    min_reviewers: 2
-    require_codeowners: true
-    require_status_checks: true
-    block_force_pushes: true
-
-  environments:
-    "prod.*":                           # regex pattern matching env names
-      required_reviewers: true
-      restrict_branches: true
-      min_wait_timer: 5
-    "staging":
-      required_reviewers: true
-
-  workflows:
-    max_default_permissions: read
-    block_pull_request_target: true
-    block_secrets_inherit: true
-    block_write_all: true
-    block_pr_approval: true
-
-  oidc:
-    require_custom_template: true
-    require_environment_claim: true
-
-scope:
-  include: [".*"]                       # all repos
-  exclude: ["docs", ".*-sandbox"]       # skip these
-```
-
-**17 policy checks** across branch protection, environments, workflows, and OIDC.
-
-### Five Views, Same Data
-
-GhostGates gives security teams five complementary perspectives from a single scan:
-
-| Command | Perspective | Audience |
-|---------|-------------|----------|
-| `ghostgates scan` | What's exploitable and how | Security engineering, AppSec |
-| `ghostgates rank` | Where to fix first | Security engineering, triage |
-| `ghostgates audit` | Are we meeting our standard | CISO, compliance, auditors |
-| `ghostgates recon` | What's my attack surface | Red team, pen test |
-| `ghostgates graph` | Show me the kill chain | Board decks, pen test reports |
-
----
-
-## Recon (Attack Surface)
-
-Reshuffles existing findings into offensive attack questions. Same data as `scan`, organized by what a red teamer asks during recon instead of by repo.
-
-```bash
-# Attack surface view from latest scan
-ghostgates recon --org my-org
-
-# JSON for tooling
-ghostgates recon --org my-org --format json
-
-# Markdown for report
-ghostgates recon --org my-org --format md -o recon.md
-```
-
-**Seven attack surface categories:**
-
-| Category | Question |
-|----------|----------|
-| Workflow Execution | Which repos allow attacker-controlled code execution in workflows? |
-| Secrets Exposure | Which pipelines expose secrets to untrusted contexts? |
-| Cloud Credential Theft | Which repos allow unauthorized cloud role assumption? |
-| Code to Prod Without Review | Which repos allow code to reach prod without human review? |
-| Production Deployment Paths | Which workflows can deploy to production? |
-| Review Bypass Paths | Which repos have circumventable branch protections? |
-| Supply Chain Injection | Which repos are vulnerable to upstream dependency poisoning? |
-
-No new API calls. No new rules. Zero additional scan time.
-
----
-
-## Kill Chain (Graph)
-
-Generate Mermaid diagrams showing attack paths from entry to impact, with bypassed gates crossed out. The terminal output is for the person who fixes it. The diagram is for the person who funds fixing it.
-
-```bash
-# Terminal kill chain view
-ghostgates graph --org my-org
-
-# Mermaid markdown (renders in GitHub, Notion, docs)
-ghostgates graph --org my-org --format mermaid -o kill-chain.md
-
-# Single repo
-ghostgates graph --org my-org --repo payments-api --format mermaid
-
-# JSON for custom rendering
-ghostgates graph --org my-org --format json
-```
-
-Each diagram shows:
-
-🔵 **Entry points** — attacker privilege level (stadium shape)
-🔴 **Bypassed gates** — the control that failed, colored by severity (hexagon)
-🟣 **Impact** — what the attacker gets (double circle)
-
-Example Mermaid output for a repo:
-
-```mermaid
-graph LR
-    entry_external(["External Attacker\n(no credentials)"])
-    entry_repo_write(["Repo Write\n(compromised dev)"])
-    bypass_WF001{{"✗ pr_target.yml\npull_request_target\n+ head checkout"}}
-    bypass_BP001{{"✗ Branch Protection\nmain\nenforce_admins=false"}}
-    bypass_OIDC002{{"✗ OIDC in deploy.yml\naws: no env gate"}}
-    impact_code_exec((("Code Execution\n+ Secret Exfil")))
-    impact_unreviewed((("Unreviewed Code\nMerged to Main")))
-    impact_cloud((("Cloud Credentials\n(no env gate)")))
-
-    entry_external --> bypass_WF001
-    bypass_WF001 --> impact_code_exec
-    entry_repo_write --> bypass_BP001
-    bypass_BP001 --> impact_unreviewed
-    entry_repo_write --> bypass_OIDC002
-    bypass_OIDC002 --> impact_cloud
-
-    style entry_external fill:#1e40af,stroke:#1e3a8a,color:#fff
-    style entry_repo_write fill:#1e40af,stroke:#1e3a8a,color:#fff
-    style bypass_WF001 fill:#dc2626,stroke:#991b1b,color:#fff
-    style bypass_BP001 fill:#ea580c,stroke:#c2410c,color:#fff
-    style bypass_OIDC002 fill:#ea580c,stroke:#c2410c,color:#fff
-    style impact_code_exec fill:#7c3aed,stroke:#6d28d9,color:#fff
-    style impact_unreviewed fill:#7c3aed,stroke:#6d28d9,color:#fff
-    style impact_cloud fill:#7c3aed,stroke:#6d28d9,color:#fff
-```
-
-Designed for pen test reports and executive briefings — the diagram a CISO forwards to engineering leadership.
-
----
-
-## Output Formats
-
-| Format | Flag | Use Case |
-|--------|------|----------|
-| Terminal | `--format terminal` (default) | Interactive review |
-| JSON | `--format json` | CI integration, programmatic analysis |
-| Markdown | `--format md` | Reports, documentation |
-| SARIF | `--format sarif` | GitHub Code Scanning / Security tab |
-
-### SARIF Integration
-
-Generate SARIF 2.1.0 output for native GitHub Code Scanning integration. Findings appear in the Security tab alongside CodeQL and Dependabot:
-
-```bash
-# Generate SARIF
-ghostgates scan --org my-org --format sarif > results.sarif
-
-# Upload to GitHub Code Scanning
-gh api -X POST /repos/{owner}/{repo}/code-scanning/sarifs \
-  --field "sarif=$(gzip -c results.sarif | base64 -w0)" \
-  --field "ref=refs/heads/main"
-```
-
-Each SARIF result includes a stable fingerprint (`rule_id|repo|instance`) for deduplication across scans.
-
----
-
-## GitHub Action
-
-Recommended for org owners who want weekly SARIF results in the GitHub Security tab.
-
-```yaml
-# .github/workflows/ghostgates-scan.yml
-name: GhostGates CI/CD Security Scan
-
-on:
-  schedule:
-    - cron: '0 9 * * 1'            # Every Monday at 9am UTC
-  workflow_dispatch:                 # Manual trigger
-
-permissions:
-  contents: read
-  security-events: write
-
-jobs:
-  ghostgates:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Install GhostGates
-        run: pip install git+https://github.com/InfoSecHack/ghostgates.git
-
-      - name: Run scan (SARIF)
-        continue-on-error: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GHOSTGATES_TOKEN }}
-        run: ghostgates scan --org ${{ github.repository_owner }} --format sarif -o results.sarif
-
-      - name: Upload SARIF to GitHub Security
-        if: always()
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: results.sarif
-          category: ghostgates
-```
-
-`continue-on-error: true` is required because the scan exits non-zero when findings exist (exit 1 = medium, exit 2 = high/critical). Without it, GitHub Actions skips the upload step even with `if: always()`.
-
-**Required secret:** `GHOSTGATES_TOKEN` — a classic PAT with `repo` + `read:org` scopes, or a fine-grained PAT with Repository Read + Organization Read permissions.
-
----
-
-## Token Permissions
-
-**Classic PAT:** `repo` + `read:org`. Optionally `admin:repo_hook` for webhook-based environment protections.
-
-**Fine-grained PAT:** Repository Read + Organization Read permissions.
-
-These scopes are required to read repository configuration, workflow files, environment rules, and organization settings. GhostGates performs read-only analysis — it never writes to your repos.
-
-**Token safety:** Tokens are never logged, stored in the database, or included in error messages. All error paths scrub token patterns before raising.
-
----
-
-## Rule Catalog (19 rules)
-
-### Branch Protection (6 rules)
-
-| ID | Rule | Severity | Min Privilege |
-|----|------|----------|---------------|
-| GHOST-BP-001 | Admin bypass of required reviews (`enforce_admins` disabled) | HIGH | repo-admin |
-| GHOST-BP-002 | Stale review approval persistence (bait-and-switch PRs) | MEDIUM | repo-write |
-| GHOST-BP-003 | Required reviews without CODEOWNERS enforcement | LOW | repo-write |
-| GHOST-BP-004 | Deployment branches lack protection | MEDIUM | repo-write |
-| GHOST-BP-005 | Workflows can approve their own PRs | HIGH | repo-write |
-| GHOST-BP-006 | Ruleset in evaluate mode (false enforcement) | HIGH/MEDIUM | repo-write |
-
-> **On admin bypasses:** A common objection to GHOST-BP-001 is *"I'm the admin — I need that flexibility."* The finding isn't about your intended use. It's about what happens when that account is compromised. A stolen maintainer token, a malicious insider, or a supply chain attack on a bot account with admin rights all inherit the same bypass. `enforce_admins: false` means the protection is only as strong as your weakest privileged credential.
-
-### Environment (3 rules)
-
-| ID | Rule | Severity | Min Privilege |
-|----|------|----------|---------------|
-| GHOST-ENV-001 | Production environment with no required reviewers | HIGH | repo-write |
-| GHOST-ENV-002 | Environment allows deployment from any branch | MEDIUM | repo-write |
-| GHOST-ENV-003 | Wait timer as only protection (auto-approve) | MEDIUM | repo-write |
-
-### Workflow (8 rules)
-
-| ID | Rule | Severity | Min Privilege |
-|----|------|----------|---------------|
-| GHOST-WF-001 | `pull_request_target` + PR head checkout (supply chain attack) | **CRITICAL** | **external** |
-| GHOST-WF-002 | Workflow with write-all permissions | HIGH | repo-write |
-| GHOST-WF-003 | Reusable workflow with `secrets: inherit` | HIGH | repo-write |
-| GHOST-WF-004 | Workflow exposes secrets to fork PRs | HIGH | external |
-| GHOST-WF-005 | Unpinned third-party action references (tag poisoning) | HIGH | external |
-| GHOST-WF-006 | `workflow_dispatch` with write permissions (stolen PAT → RCE) | HIGH | repo-write |
-| GHOST-WF-007 | `contents:write` without environment gate (repo takeover) | HIGH | repo-write |
-| GHOST-WF-008 | Package/release publish without environment gate | HIGH | repo-write |
-
-> **On supply chain rules (WF-005 through WF-008):** These four rules were added after the [March 2026 Trivy supply chain incident](https://github.com/aquasecurity/trivy/issues/10265), where a stolen PAT was used to delete releases, overwrite the repo, and publish a malicious VS Code extension. The same campaign targeted Microsoft, DataDog, and CNCF repos. WF-005 catches the unpinned action vector. WF-006 catches the stolen PAT + dispatch vector. WF-007 catches the contents:write blast radius amplifier. WF-008 catches the malicious publish vector.
-
-### OIDC (2 rules)
-
-| ID | Rule | Severity | Min Privilege |
-|----|------|----------|---------------|
-| GHOST-OIDC-001 | Default/broad OIDC subject claim | HIGH | repo-write |
-| GHOST-OIDC-002 | OIDC token used without environment gate | HIGH | repo-write |
-
----
+ghostgates scan --org example-org --format json -o report.json
+ghostgates scan --org example-org --format sarif -o report.sarif
+ghostgates offline --org example-org --db ghostgates.db
+ghostgates diff --org example-org --db ghostgates.db
+ghostgates rank --org example-org --db ghostgates.db
+ghostgates recon --org example-org --db ghostgates.db
+ghostgates graph --org example-org --db ghostgates.db --format mermaid
+ghostgates audit --org example-org --policy ghostgates-policy.example.yml
+~~~
+
+The attacker option is a maximum prerequisite filter. For example, repo-write includes findings whose stated prerequisite is external, organization membership, or repository write access. Public and private repositories can produce different per-finding prerequisites.
+
+Scan exit statuses are fixed: 0 for no medium-or-higher findings, 1 for
+medium findings, 2 for high or critical findings, and 3 when collection was
+incomplete. Completeness requires successful repository enumeration, coverage
+of the requested and selected repository scope, and no collection errors.
+There is no configurable fail-on threshold. Severity labels are output data,
+so changing a label can change the fixed exit status. An incomplete report may
+still contain useful partial results.
+
+## Rule coverage
+
+There are 18 registered rules. Run ghostgates list-rules for the authoritative names and metadata.
+
+| Area | IDs | Review question |
+|---|---|---|
+| Branch protection | GHOST-BP-001, 002, 003 | Can observed review settings be bypassed by an admin, stale approval, or missing CODEOWNERS enforcement? |
+| Actions approval setting | GHOST-BP-005 | Is the Actions pull-request approval setting enabled where protected branches require reviews? |
+| Rulesets | GHOST-BP-006 | Is a ruleset only evaluating rather than enforcing? |
+| Environments | GHOST-ENV-001 through 003 | Are deployment reviewers or branch restrictions absent, or are custom protection rules unmodeled? |
+| Workflow trust | GHOST-WF-001 through 004 | Do trigger, checkout, permission, secret-inheritance, or workflow-run boundaries interact unsafely? |
+| Workflow dependencies and publishing | GHOST-WF-005 through 008 | Do mutable action references, manual write-capable runs, or ungated write/publish jobs need review? |
+| OIDC | GHOST-OIDC-001 and 002 | Do GitHub-side subject and environment controls need comparison with an external cloud trust policy? |
+
+Rules intentionally vary in confidence. In particular:
+
+- a mutable third-party reference requires an upstream change or compromise before it affects a run;
+- workflow_dispatch with write permissions requires an authorized dispatcher and security-sensitive workflow behavior;
+- a named environment is only treated as a human gate when collected configuration shows required reviewers; and
+- an OIDC finding never proves cloud access because cloud trust policies are not collected.
+
+## Outputs
+
+The scan command supports terminal, JSON, Markdown, and SARIF output. Stored scans can also be:
+
+- diffed to show finding drift, with missing results kept unverified after incomplete scans or rule removal;
+- ordered with an explicitly uncalibrated review-priority heuristic;
+- regrouped as security-review questions; or
+- rendered as a prerequisite → finding → potential-consequence graph.
+
+The graph is a presentation of individual finding relationships. It does not establish a composed exploit chain between findings. Review-priority points and tiers are not risk, likelihood, exploitability, CVSS, or impact measurements.
+
+SARIF output maps GhostGates severity categories to SARIF levels and to
+documented security-severity category representatives (9.1, 7.0, 4.0, 0.1,
+and 0.0). Those values are not calculated CVSS scores. GhostGates does not
+emit machine-applicable fixes.
+
+## Policy audit
+
+The policy command evaluates collected models against a local YAML policy:
+
+~~~
+ghostgates audit \
+  --org example-org \
+  --policy ghostgates-policy.example.yml \
+  --repos example-repo
+~~~
+
+Policy compliance means only that the modeled fields matched the supplied policy checks. It is not certification or proof of repository security.
 
 ## Architecture
 
-```
-GitHub API
-    ↓
-Collectors (org, repos, environments, workflows)
-    ↓
-GateModel (per-repo structured data)
-    ↓
-┌─────────────────────────────────────────┐
-│           Rule Engine (19 rules)        │
-│   decorator-registered, attacker-level  │
-│         parameterized                   │
-└─────────────────────────────────────────┘
-    ↓                    ↓
-Findings              GateModel
-    ↓                    ↓
-┌──────────┐     ┌──────────────┐
-│ Reporting│     │ Policy Audit │
-│          │     │              │
-│ terminal │     │ YAML policy  │
-│ JSON     │     │ 17 checks    │
-│ markdown │     │ compliance % │
-│ SARIF    │     └──────────────┘
-│ rank     │
-│ recon    │
-│ graph    │
-└──────────┘
-```
+The implementation is deliberately small:
 
-Key design principles:
+~~~
+GitHub API + workflow YAML
+          |
+       collectors
+          |
+       GateModel
+          |
+   registry + rules
+          |
+      findings
+          |
+ reports / SQLite / policy audit
+~~~
 
-- **GateModel abstraction** — Rules never call APIs. All data is pre-collected into a typed model.
-- **Decorator-based rules** — `@registry.rule(...)` auto-registers rules, filterable by attacker level and gate type.
-- **Evidence-first** — Every finding includes the raw config values that prove the bypass.
-- **Attacker modeling** — Findings are parameterized by minimum privilege level, not just severity.
-- **Policy-as-code** — Define your security standard in YAML, measure compliance programmatically.
-- **Fail-safe parsing** — The workflow YAML parser never crashes; malformed files produce `parse_errors`, not exceptions.
+Collectors record configuration. Pydantic models provide the boundary between collection and reasoning. Rules consume a GateModel and emit findings with evidence, a prerequisite, conditions, remediation, and an inferred path. Reporting reorganizes those findings without adding observations.
 
----
+See [ARCHITECTURE.md](ARCHITECTURE.md) for boundaries and known modeling limits.
 
-## Development
+## Testing and validation status
 
-```bash
-# Run all tests
-pytest tests/ -v
+The test suite includes:
 
-# Run specific rule tests
-pytest tests/test_engine_bp_rules.py -v
-pytest tests/test_engine_env_wf_oidc.py -v
+- parsers and collectors exercised against synthetic GitHub responses;
+- rule tests with positive, negative, and boundary cases;
+- client regressions for pagination, permission failures, rate-limit slots, and token scrubbing;
+- storage and policy round trips; and
+- a mocked-HTTP pipeline test covering collection, analysis, storage, and formatting.
 
-# Run new feature tests
-pytest tests/test_rank.py -v
-pytest tests/test_sarif.py -v
-pytest tests/test_policy_audit.py -v
-pytest tests/test_recon.py -v
-pytest tests/test_graph.py -v
-pytest tests/test_supply_chain_rules.py -v
+These are not live GitHub integration tests. The repository currently contains no reproducible external-validation record that establishes rule coverage against a real GitHub organization or cloud environment. Treat live behavior and exploitability as unvalidated until a human reproduces them in a controlled environment.
 
-# Run with debug output
-pytest tests/ -v --tb=long -s
-```
+## Known limitations
 
-516 tests, ~17K lines of Python.
+- Only the default branch's classic protection is collected; rulesets are modeled separately.
+- Missing or unauthorized API data can make the model incomplete.
+- Repository workflows are parsed statically. Expressions, generated configuration, composite actions, and called workflows are not fully evaluated.
+- First-party action ownership is identified by exact owner name, not by provenance verification.
+- Environment custom protection rules are recorded but their runtime decision behavior is unknown.
+- OIDC rules do not inspect AWS, Azure, GCP, or other provider trust policies.
+- The tool does not enumerate collaborators, teams, effective identities, secrets, artifacts, packages, deployments, or workflow-run history.
+- Finding severities and review-priority weights are project heuristics, not empirically calibrated measurements.
+- A SARIF rule descriptor uses metadata from the first finding with that rule ID; per-instance severity remains on each SARIF result.
+- No finding and policy compliance are both weaker statements than proof of safety.
 
----
+## Development transparency
 
-## Adding New Rules
+Codex and Claude Code were heavily used for implementation. The project author directed the threat model, test goals, validation work, and interpretation of results. AI assistance is part of the project's development method and research subject, not a claim of independent verification.
 
-```python
-from ghostgates.engine.registry import registry
-from ghostgates.models.enums import AttackerLevel, Confidence, GateType, Severity
-from ghostgates.models.gates import GateModel
-from ghostgates.models.findings import BypassFinding
+## Data and security
 
-@registry.rule(
-    rule_id="GHOST-XX-001",
-    name="My new bypass rule",
-    gate_type=GateType.WORKFLOW,
-    min_privilege=AttackerLevel.REPO_WRITE,
-    tags=("workflow", "custom"),
-)
-def xx_001_my_rule(gate: GateModel) -> list[BypassFinding]:
-    findings = []
-    # Check gate model for bypass condition
-    # Append BypassFinding with evidence if found
-    return findings
-```
+GhostGates is intended for authorized review of organizations and repositories you are permitted to inspect. It stores collected models and scan results in a local SQLite database by default. Models can include raw workflow YAML and raw API fields, so protect the database and generated reports according to the sensitivity of the source repository.
 
-Then import the module in `ghostgates/engine/__init__.py` and it auto-registers.
-
----
-
-## How GhostGates Compares
-
-| Tool | What it does | Approach |
-|------|-------------|----------|
-| [Gato](https://github.com/praetorian-inc/gato) | Exploits GitHub Actions (self-hosted runners, secret exfil) | Offensive exploitation |
-| [GitOops](https://github.com/ovotech/gitoops) | Maps user→repo→secret graph paths in Neo4j | Graph traversal (archived) |
-| [Actions Attack Diagram](https://github.com/jstawinski/GitHub-Actions-Attack-Diagram) | Reference flowchart of Actions attack paths | Educational diagram |
-| **GhostGates** | Audits structural bypass paths + policy compliance + attack surface | Defensive analysis + red team recon |
-
-Gato exploits. GitOops maps. GhostGates audits. They solve different problems.
-
-One of the few open-source tools that analyzes branch protections, environments, workflows, OIDC, and rulesets together as a single structural security model.
-
----
-
-## Roadmap
-
-- GitLab CI support
-- Azure DevOps pipelines
-- PyPI package (`pip install ghostgates`)
-- Expanded rule catalog
-- Pipeline security benchmarking
-
----
+Tokens are read from the command line option or GITHUB_TOKEN environment variable and sent to GitHub through the API client. Prefer environment-based token handling, least privilege, scoped repository selection, and short-lived credentials. See [SECURITY.md](SECURITY.md).
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
+MIT. See [LICENSE](LICENSE).

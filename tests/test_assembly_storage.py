@@ -24,7 +24,7 @@ from ghostgates.collectors.assembly import (
 from ghostgates.models.enums import AttackerLevel, Confidence, GateType, Severity
 from ghostgates.models.gates import (
     BranchProtection,
-    Collaborator,
+    CollectionError,
     EnvironmentConfig,
     GateModel,
     OIDCConfig,
@@ -33,7 +33,7 @@ from ghostgates.models.gates import (
     WorkflowPermissions,
     WorkflowTrigger,
 )
-from ghostgates.models.findings import BypassFinding, ScanResult
+from ghostgates.models.findings import BypassFinding, ScanResult, ScanScope
 from ghostgates.storage.sqlite_store import SQLiteStore
 
 
@@ -114,10 +114,6 @@ def _make_gate_model_with_data() -> GateModel:
             ),
         ],
         oidc=OIDCConfig(org_level_template=["repo", "ref"]),
-        collaborators=[
-            Collaborator(login="alice", id=1, permission="admin"),
-            Collaborator(login="bob", id=2, permission="write"),
-        ],
         collected_at=datetime.now(timezone.utc),
     )
 
@@ -271,8 +267,6 @@ class TestGateModelCRUD:
 
         assert retrieved.oidc.org_level_template == ["repo", "ref"]
 
-        assert len(retrieved.collaborators) == 2
-        assert retrieved.collaborators[0].permission == "admin"
 
 
 # ==================================================================
@@ -340,6 +334,27 @@ class TestScanResultCRUD:
         assert len(f.gating_conditions) == 1
         assert f.remediation == "Fix 0"
 
+    def test_scope_and_structured_errors_round_trip(self, store):
+        result = _make_scan_result(n_findings=0)
+        result.errors = [CollectionError(
+            collector="rulesets",
+            repo="test-org/repo",
+            message="403 Forbidden",
+        )]
+        result.scope = ScanScope(
+            discovered_repositories=["test-org/repo"],
+            selected_repositories=["test-org/repo"],
+            evaluated_repositories=["test-org/repo"],
+            enumeration_complete=True,
+        )
+
+        row_id = store.save_scan_result(result)
+        retrieved = store.get_scan_result(row_id)
+
+        assert retrieved.scope == result.scope
+        assert retrieved.errors == result.errors
+        assert not retrieved.is_complete
+
 
 # ==================================================================
 # Tests: Assembly helpers (unit, no API)
@@ -387,9 +402,12 @@ class TestAssemblyHelpers:
 
     def test_build_workflow_permissions_repo_overrides(self):
         org = {"default_workflow_permissions": "write", "can_approve_pull_request_reviews": True}
-        repo = {"can_approve_pull_request_reviews": False}
+        repo = {
+            "default_workflow_permissions": "read",
+            "can_approve_pull_request_reviews": False,
+        }
         perms = _build_workflow_permissions(org, repo)
-        assert perms.default_workflow_permissions == "write"  # from org
+        assert perms.default_workflow_permissions == "read"  # repo override
         assert perms.can_approve_pull_request_reviews is False  # repo override
 
     def test_build_oidc_config_none(self):
@@ -419,7 +437,6 @@ class TestAssemblyOrchestration:
             patch("ghostgates.collectors.assembly.collect_branch_protections") as mock_bp,
             patch("ghostgates.collectors.assembly.collect_environments") as mock_env,
             patch("ghostgates.collectors.assembly.collect_workflows") as mock_wf,
-            patch("ghostgates.collectors.assembly.collect_collaborators") as mock_collab,
             patch("ghostgates.collectors.assembly.collect_rulesets") as mock_rs,
             patch("ghostgates.collectors.assembly._collect_repo_actions_permissions") as mock_perms,
         ):
@@ -437,21 +454,18 @@ class TestAssemblyOrchestration:
                 EnvironmentConfig(name="production"),
             ]
             mock_wf.return_value = []
-            mock_collab.return_value = [
-                Collaborator(login="alice", id=1, permission="admin"),
-            ]
             mock_rs.return_value = []
             mock_perms.return_value = {}
 
-            models, errors = await collect_org_gate_models(mock_client, "acme")
+            result = await collect_org_gate_models(mock_client, "acme")
 
-            assert len(models) == 1
-            assert errors == []
-            assert models[0].org == "acme"
-            assert models[0].repo == "web-app"
-            assert len(models[0].branch_protections) == 1
-            assert len(models[0].environments) == 1
-            assert len(models[0].collaborators) == 1
+            assert len(result.gate_models) == 1
+            assert result.errors == []
+            assert result.scope.is_complete
+            assert result.gate_models[0].org == "acme"
+            assert result.gate_models[0].repo == "web-app"
+            assert len(result.gate_models[0].branch_protections) == 1
+            assert len(result.gate_models[0].environments) == 1
 
     @pytest.mark.asyncio
     async def test_collect_with_repo_filter(self):
@@ -464,7 +478,6 @@ class TestAssemblyOrchestration:
             patch("ghostgates.collectors.assembly.collect_branch_protections") as mock_bp,
             patch("ghostgates.collectors.assembly.collect_environments") as mock_env,
             patch("ghostgates.collectors.assembly.collect_workflows") as mock_wf,
-            patch("ghostgates.collectors.assembly.collect_collaborators") as mock_collab,
             patch("ghostgates.collectors.assembly.collect_rulesets") as mock_rs,
             patch("ghostgates.collectors.assembly._collect_repo_actions_permissions") as mock_perms,
         ):
@@ -477,16 +490,17 @@ class TestAssemblyOrchestration:
             mock_bp.return_value = []
             mock_env.return_value = []
             mock_wf.return_value = []
-            mock_collab.return_value = []
             mock_rs.return_value = []
             mock_perms.return_value = {}
 
-            models, errors = await collect_org_gate_models(
+            result = await collect_org_gate_models(
                 mock_client, "acme", repo_filter=["api"]
             )
 
-            assert len(models) == 1
-            assert models[0].repo == "api"
+            assert len(result.gate_models) == 1
+            assert result.gate_models[0].repo == "api"
+            assert result.scope.requested_repositories == ["acme/api"]
+            assert result.scope.is_complete
 
     @pytest.mark.asyncio
     async def test_single_repo_failure_doesnt_stop_scan(self):
@@ -499,7 +513,6 @@ class TestAssemblyOrchestration:
             patch("ghostgates.collectors.assembly.collect_branch_protections") as mock_bp,
             patch("ghostgates.collectors.assembly.collect_environments") as mock_env,
             patch("ghostgates.collectors.assembly.collect_workflows") as mock_wf,
-            patch("ghostgates.collectors.assembly.collect_collaborators") as mock_collab,
             patch("ghostgates.collectors.assembly.collect_rulesets") as mock_rs,
             patch("ghostgates.collectors.assembly._collect_repo_actions_permissions") as mock_perms,
         ):
@@ -520,13 +533,100 @@ class TestAssemblyOrchestration:
             mock_bp.side_effect = bp_side_effect
             mock_env.return_value = []
             mock_wf.return_value = []
-            mock_collab.return_value = []
             mock_rs.return_value = []
             mock_perms.return_value = {}
 
-            models, errors = await collect_org_gate_models(mock_client, "acme")
+            result = await collect_org_gate_models(mock_client, "acme")
 
-            assert len(models) == 1
-            assert models[0].repo == "good"
-            assert len(errors) == 1
-            assert "bad" in errors[0]
+            assert len(result.gate_models) == 2
+            bad_model = next(
+                model for model in result.gate_models if model.repo == "bad"
+            )
+            assert bad_model.branch_protections == []
+            assert len(result.errors) == 1
+            assert result.errors[0].repo == "acme/bad"
+            assert result.errors[0].collector == "branch_protections"
+            assert not result.scope.is_complete or result.errors
+
+    @pytest.mark.asyncio
+    async def test_subcollector_403s_preserve_partial_model_and_completeness(self):
+        mock_client = AsyncMock()
+
+        with (
+            patch("ghostgates.collectors.assembly.collect_org_metadata") as mock_org_meta,
+            patch("ghostgates.collectors.assembly.collect_repos") as mock_repos,
+            patch("ghostgates.collectors.assembly.collect_branch_protections") as mock_bp,
+            patch("ghostgates.collectors.assembly.collect_environments") as mock_env,
+            patch("ghostgates.collectors.assembly.collect_workflows") as mock_wf,
+            patch("ghostgates.collectors.assembly.collect_rulesets") as mock_rs,
+            patch("ghostgates.collectors.assembly._collect_repo_actions_permissions") as mock_perms,
+        ):
+            mock_org_meta.return_value = {
+                "actions_permissions": {},
+                "oidc_template": None,
+            }
+            mock_repos.return_value = [{
+                "name": "api",
+                "default_branch": "main",
+                "visibility": "private",
+                "fork": False,
+                "archived": False,
+            }]
+            mock_bp.return_value = []
+            mock_env.side_effect = PermissionError("403 environments")
+            mock_wf.return_value = []
+            mock_rs.side_effect = PermissionError("403 rulesets")
+            mock_perms.return_value = {}
+
+            result = await collect_org_gate_models(mock_client, "acme")
+
+        assert len(result.gate_models) == 1
+        model = result.gate_models[0]
+        assert model.environments == []
+        assert model.rulesets == []
+        assert {error.collector for error in model.collection_errors} == {
+            "environments", "rulesets",
+        }
+        scan = ScanResult(
+            org="acme",
+            repos_scanned=1,
+            errors=result.errors,
+            scope=result.scope,
+            attacker_level=AttackerLevel.ORG_OWNER,
+        )
+        assert not scan.is_complete
+
+    @pytest.mark.asyncio
+    async def test_zero_repo_scope_distinguishes_empty_from_filter_collapse(self):
+        mock_client = AsyncMock()
+
+        with (
+            patch("ghostgates.collectors.assembly.collect_org_metadata") as mock_org_meta,
+            patch("ghostgates.collectors.assembly.collect_repos") as mock_repos,
+        ):
+            mock_org_meta.return_value = {
+                "actions_permissions": {},
+                "oidc_template": None,
+            }
+            mock_repos.return_value = [{
+                "name": "visible",
+                "default_branch": "main",
+                "visibility": "private",
+                "fork": False,
+                "archived": False,
+            }]
+            collapsed = await collect_org_gate_models(
+                mock_client, "acme", repo_filter=["missing"]
+            )
+
+            mock_repos.return_value = []
+            known_empty = await collect_org_gate_models(mock_client, "acme")
+
+        assert collapsed.gate_models == []
+        assert not collapsed.scope.is_complete
+        assert collapsed.errors[0].collector == "repository_filter"
+        assert collapsed.errors[0].repo == "acme/missing"
+
+        assert known_empty.gate_models == []
+        assert known_empty.errors == []
+        assert known_empty.scope.is_complete

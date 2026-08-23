@@ -34,28 +34,14 @@ async def collect_environments(
     """Collect all environments and their protection rules for a repo.
 
     Returns an empty list if the repo has no environments (not an error).
-    Individual environment parsing failures are logged and skipped.
+    Parsing failures propagate so assembly can mark the evidence incomplete.
     """
-    try:
-        raw_envs = await client.list_environments(owner, repo)
-    except Exception as exc:
-        logger.debug("Error listing environments for %s/%s: %s", owner, repo, exc)
-        return []
+    raw_envs = await client.list_environments(owner, repo)
 
     if not raw_envs:
         return []
 
-    environments: list[EnvironmentConfig] = []
-    for raw in raw_envs:
-        try:
-            env = _parse_environment(raw)
-            environments.append(env)
-        except Exception as exc:
-            env_name = raw.get("name", "?")
-            logger.warning(
-                "Failed to parse environment '%s' for %s/%s: %s",
-                env_name, owner, repo, exc,
-            )
+    environments = [_parse_environment(raw) for raw in raw_envs]
 
     logger.debug(
         "Collected %d environments for %s/%s", len(environments), owner, repo
@@ -114,26 +100,22 @@ def _parse_environment(raw: dict) -> EnvironmentConfig:
             pass
 
         else:
-            # Custom deployment protection rules (external webhooks)
-            # These have an "app" field with the webhook app info
-            app_info = rule.get("app", {})
-            if app_info:
-                custom_rules.append(CustomProtectionRule(
-                    id=rule.get("id", 0),
-                    app_slug=app_info.get("slug", "unknown"),
-                    timeout_minutes=_infer_timeout(rule),
-                ))
+            # Unknown rule types are custom rules even when GitHub omits app data.
+            app_info = rule.get("app")
+            app_slug = (
+                app_info.get("slug", "unknown")
+                if isinstance(app_info, dict)
+                else "unknown"
+            )
+            custom_rules.append(CustomProtectionRule(
+                id=rule.get("id", 0),
+                app_slug=app_slug,
+            ))
 
     # --- Parse deployment branch policy ---
     deployment_policy = _parse_deployment_branch_policy(
         raw.get("deployment_branch_policy")
     )
-
-    # --- Detect if environment has secrets ---
-    # The environments API doesn't directly tell us about secrets.
-    # We flag has_secrets=False and let the assembly layer or a
-    # separate call update this if needed.
-    has_secrets = False
 
     return EnvironmentConfig(
         name=name,
@@ -142,7 +124,6 @@ def _parse_environment(raw: dict) -> EnvironmentConfig:
         reviewers=reviewers,
         wait_timer=wait_timer,
         custom_rules=custom_rules,
-        has_secrets=has_secrets,
         raw=raw,
     )
 
@@ -208,21 +189,3 @@ def _parse_deployment_branch_policy(
         return EnvironmentProtection(type="selected", patterns=[])
     else:
         return EnvironmentProtection(type="none", patterns=[])
-
-
-def _infer_timeout(rule: dict) -> int:
-    """Infer custom protection rule timeout.
-
-    GitHub's default is 30 minutes — if the external check doesn't
-    respond within this window, the deployment is auto-approved.
-    The API doesn't always expose this directly.
-    """
-    # Some custom rules expose a timeout field
-    timeout = rule.get("timeout", rule.get("timeout_minutes"))
-    if timeout is not None:
-        try:
-            return int(timeout)
-        except (ValueError, TypeError):
-            pass
-    # Default to GitHub's documented 30-minute timeout
-    return 30

@@ -1,8 +1,4 @@
-"""GhostGates — shared enumerations.
-
-Section 3 of ARCHITECTURE.md.  No other module may define its own enums;
-all enum usage across the codebase imports from here.
-"""
+"""Shared enumerations used by models, rules, policy, and reports."""
 
 from enum import StrEnum
 

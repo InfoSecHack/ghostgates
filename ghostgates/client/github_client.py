@@ -2,10 +2,6 @@
 ghostgates/client/github_client.py
 
 Async GitHub REST API client with rate limiting, pagination, and retry.
-
-Security invariants:
-  - The PAT is NEVER logged, stored, or included in exceptions.
-  - All error messages are scrubbed before propagation.
 """
 
 from __future__ import annotations
@@ -199,14 +195,6 @@ class GitHubClient:
         result = await self.get(f"/repos/{owner}/{repo}/environments/{env_name}")
         return result if isinstance(result, dict) else {}
 
-    async def list_collaborators(self, owner: str, repo: str) -> list[dict]:
-        """List collaborators with their permission levels."""
-        _validate_name(owner)
-        _validate_name(repo)
-        return await self.get_paginated(
-            f"/repos/{owner}/{repo}/collaborators", {"affiliation": "all"}
-        )
-
     async def get_workflow_content(self, owner: str, repo: str, path: str) -> str:
         """Fetch raw workflow YAML content from the default branch."""
         _validate_name(owner)
@@ -243,22 +231,15 @@ class GitHubClient:
         _validate_name(owner)
         _validate_name(repo)
         merged: dict = {}
-        # General actions permissions
-        try:
-            general = await self.get(f"/repos/{owner}/{repo}/actions/permissions")
-            if isinstance(general, dict):
-                merged.update(general)
-        except GitHubClientError as exc:
-            if "403" not in str(exc):
-                raise
-        # Workflow-specific permissions (separate endpoint)
-        try:
-            workflow = await self.get(f"/repos/{owner}/{repo}/actions/permissions/workflow")
-            if isinstance(workflow, dict):
-                merged.update(workflow)
-        except GitHubClientError as exc:
-            if "403" not in str(exc):
-                raise
+        general = await self.get(f"/repos/{owner}/{repo}/actions/permissions")
+        if isinstance(general, dict):
+            merged.update(general)
+
+        workflow = await self.get(
+            f"/repos/{owner}/{repo}/actions/permissions/workflow"
+        )
+        if isinstance(workflow, dict):
+            merged.update(workflow)
         return merged
 
     async def list_rulesets(self, owner: str, repo: str) -> list[dict]:
@@ -306,16 +287,13 @@ class GitHubClient:
 
                 # Rate-limited — back off and retry
                 if response.status_code in (403, 429):
-                    retry_after_hdr = response.headers.get("retry-after", "")
-                    # Distinguish between rate limit 403 and permission 403
-                    if response.status_code == 403 and not retry_after_hdr:
+                    if not _is_rate_limit_response(response):
                         body = _safe_json(response)
                         msg = body.get("message", "") if isinstance(body, dict) else ""
-                        if "rate limit" not in msg.lower() and "abuse" not in msg.lower():
-                            # Real 403 (permission denied), not rate limit
-                            raise GitHubClientError(
-                                f"403 Forbidden: {_scrub(msg)} (path={path})"
-                            )
+                        self._rate_limiter.release()
+                        raise GitHubClientError(
+                            f"403 Forbidden: {_scrub(msg)} (path={path})"
+                        )
                     await self._rate_limiter.handle_rate_limit(
                         response.status_code, dict(response.headers)
                     )
@@ -386,6 +364,13 @@ class GitHubClient:
                 self._rate_limiter.update_from_headers(dict(response.headers))
 
                 if response.status_code in (403, 429):
+                    if not _is_rate_limit_response(response):
+                        body = _safe_json(response)
+                        msg = body.get("message", "") if isinstance(body, dict) else ""
+                        self._rate_limiter.release()
+                        raise GitHubClientError(
+                            f"403 Forbidden: {_scrub(msg)} (path={path})"
+                        )
                     await self._rate_limiter.handle_rate_limit(
                         response.status_code, dict(response.headers)
                     )
@@ -443,6 +428,13 @@ class GitHubClient:
                 self._rate_limiter.update_from_headers(dict(response.headers))
 
                 if response.status_code in (403, 429):
+                    if not _is_rate_limit_response(response):
+                        body = _safe_json(response)
+                        msg = body.get("message", "") if isinstance(body, dict) else ""
+                        self._rate_limiter.release()
+                        raise GitHubClientError(
+                            f"403 Forbidden: {_scrub(msg)} (url={url})"
+                        )
                     await self._rate_limiter.handle_rate_limit(
                         response.status_code, dict(response.headers)
                     )
@@ -495,6 +487,13 @@ class GitHubClient:
                 self._rate_limiter.update_from_headers(dict(response.headers))
 
                 if response.status_code in (403, 429):
+                    if not _is_rate_limit_response(response):
+                        body = _safe_json(response)
+                        msg = body.get("message", "") if isinstance(body, dict) else ""
+                        self._rate_limiter.release()
+                        raise GitHubClientError(
+                            f"403 Forbidden: {_scrub(msg)} (path={path})"
+                        )
                     await self._rate_limiter.handle_rate_limit(
                         response.status_code, dict(response.headers)
                     )
@@ -561,14 +560,26 @@ def _safe_json(response: httpx.Response) -> dict | list | str:
     except Exception:
         return {}
 
+def _is_rate_limit_response(response: httpx.Response) -> bool:
+    """Distinguish GitHub rate-limit responses from permission-denied 403s."""
+    if response.status_code == 429:
+        return True
+    if response.headers.get("retry-after"):
+        return True
+    body = _safe_json(response)
+    message = body.get("message", "") if isinstance(body, dict) else ""
+    lowered = message.lower()
+
+    return "rate limit" in lowered or "abuse" in lowered
+
+
 
 def _scrub(message: str) -> str:
     """Remove anything that looks like a token from an error message.
-
-    Catches patterns: ghp_*, gho_*, github_pat_*, Bearer *, token=*
+    Catches patterns: ghp_*, ghr_*, gho_*, github_pat_*, Bearer *, token=*
     """
     scrubbed = re.sub(
-        r"(gh[psoua]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)", "***", message
+        r"(gh[prsoua]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)", "***", message
     )
     scrubbed = re.sub(r"(Bearer\s+)\S+", r"\1***", scrubbed)
     scrubbed = re.sub(r"(token[=:]\s*)\S+", r"\1***", scrubbed)

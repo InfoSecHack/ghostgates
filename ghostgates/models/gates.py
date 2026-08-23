@@ -1,11 +1,4 @@
-"""GhostGates — gate models.
-
-Section 4 of ARCHITECTURE.md.
-
-These represent the collected state of a repository's security gates.
-Collectors produce these; the rule engine consumes them.
-No I/O, no HTTP, no async.
-"""
+"""Normalized GitHub configuration consumed by the rule engine."""
 
 from __future__ import annotations
 
@@ -75,7 +68,18 @@ class CustomProtectionRule(BaseModel):
 
     id: int
     app_slug: str
-    timeout_minutes: int = 30                                                # GitHub default: 30 min, auto-approve if no response
+
+
+class CollectionError(BaseModel):
+    """A collector failure that left modeled configuration incomplete."""
+
+    collector: str
+    message: str
+    repo: str = ""
+
+    def __str__(self) -> str:
+        scope = f"{self.repo}: " if self.repo else ""
+        return f"{scope}{self.collector}: {self.message}"
 
 
 class EnvironmentConfig(BaseModel):
@@ -89,7 +93,6 @@ class EnvironmentConfig(BaseModel):
     reviewers: list[EnvironmentReviewer] = Field(default_factory=list)
     wait_timer: int = 0                                                      # minutes
     custom_rules: list[CustomProtectionRule] = Field(default_factory=list)
-    has_secrets: bool = False                                                # whether env has secrets configured
     raw: dict = Field(default_factory=dict)
 
 
@@ -154,18 +157,7 @@ class OIDCConfig(BaseModel):
     """OIDC subject claim customization."""
 
     org_level_template: list[str] = Field(default_factory=list)             # claim keys
-    repo_level_overrides: dict = Field(default_factory=dict)
     raw: dict = Field(default_factory=dict)
-
-
-class Collaborator(BaseModel):
-    """Repository collaborator with permission level."""
-
-    login: str
-    id: int
-    permission: str                                                          # "admin", "maintain", "write", "triage", "read"
-    is_team: bool = False
-    team_slug: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -196,5 +188,5 @@ class GateModel(BaseModel):
     )
     workflows: list[WorkflowDefinition] = Field(default_factory=list)
     oidc: OIDCConfig = Field(default_factory=lambda: OIDCConfig())
-    collaborators: list[Collaborator] = Field(default_factory=list)
+    collection_errors: list[CollectionError] = Field(default_factory=list)
     collected_at: datetime | None = None

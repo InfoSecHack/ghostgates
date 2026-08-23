@@ -10,6 +10,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from ghostgates.models.gates import CollectionError
+
 if TYPE_CHECKING:
     from ghostgates.client.github_client import GitHubClient
 
@@ -17,18 +19,11 @@ logger = logging.getLogger("ghostgates.collectors.org")
 
 
 async def collect_org_metadata(client: GitHubClient, org: str) -> dict:
-    """Collect org-level settings that apply to all repositories.
-
-    Returns a dict with keys:
-        - actions_permissions: dict from GitHub Actions permissions endpoint
-        - oidc_template: dict | None from OIDC subject claim customization
-
-    Both keys are always present. Individual failures are logged and
-    the corresponding value is set to a safe default (empty dict / None).
-    """
+    """Collect org settings and record evidence that could not be observed."""
     result: dict = {
         "actions_permissions": {},
         "oidc_template": None,
+        "collection_errors": [],
     }
 
     # --- Actions permissions ---
@@ -41,16 +36,13 @@ async def collect_org_metadata(client: GitHubClient, org: str) -> dict:
             perms.get("enabled_repositories", "unknown"),
         )
     except Exception as exc:
-        exc_str = str(exc)
-        if "403" in exc_str:
-            logger.info(
-                "Org-level Actions permissions not accessible for '%s' "
-                "(requires admin:org scope — using repo-level settings)", org,
-            )
-        else:
-            logger.warning(
-                "Failed to collect Actions permissions for org '%s': %s", org, exc
-            )
+        result["collection_errors"].append(CollectionError(
+            collector="org_actions_permissions",
+            message=str(exc),
+        ))
+        logger.warning(
+            "Failed to collect Actions permissions for org '%s': %s", org, exc
+        )
 
     # --- OIDC subject claim customization ---
     try:
@@ -65,15 +57,12 @@ async def collect_org_metadata(client: GitHubClient, org: str) -> dict:
         else:
             logger.debug("No OIDC template configured for org '%s'", org)
     except Exception as exc:
-        exc_str = str(exc)
-        if "403" in exc_str or "404" in exc_str:
-            logger.info(
-                "OIDC subject customization not configured for org '%s' "
-                "(using default claims)", org,
-            )
-        else:
-            logger.warning(
-                "Failed to collect OIDC template for org '%s': %s", org, exc
-            )
+        result["collection_errors"].append(CollectionError(
+            collector="org_oidc_template",
+            message=str(exc),
+        ))
+        logger.warning(
+            "Failed to collect OIDC template for org '%s': %s", org, exc
+        )
 
     return result

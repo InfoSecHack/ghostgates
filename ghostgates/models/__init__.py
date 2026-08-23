@@ -15,11 +15,12 @@ from ghostgates.models.enums import (
 )
 from ghostgates.models.findings import (
     BypassFinding,
+    ScanScope,
     ScanResult,
 )
 from ghostgates.models.gates import (
     BranchProtection,
-    Collaborator,
+    CollectionError,
     CustomProtectionRule,
     EnvironmentConfig,
     EnvironmentProtection,
@@ -42,7 +43,7 @@ __all__ = [
     "Severity",
     # gate sub-models
     "BranchProtection",
-    "Collaborator",
+    "CollectionError",
     "CustomProtectionRule",
     "EnvironmentConfig",
     "EnvironmentProtection",
@@ -58,5 +59,6 @@ __all__ = [
     "GateModel",
     # finding models
     "BypassFinding",
+    "ScanScope",
     "ScanResult",
 ]

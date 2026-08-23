@@ -19,13 +19,8 @@ from ghostgates.models.gates import GateModel
 
 from tests.mocks.gate_models import (
     make_bp,
-    make_environment,
     make_gate,
-    make_reviewer,
     make_ruleset,
-    make_trigger,
-    make_workflow,
-    make_job,
 )
 
 
@@ -35,17 +30,17 @@ from tests.mocks.gate_models import (
 
 class TestRegistry:
     def test_rules_registered(self):
-        """All 6 BP rules are registered."""
+        """Only rules based on collected branch/ruleset evidence are registered."""
         ids = {r.rule_id for r in registry.rules}
         assert "GHOST-BP-001" in ids
         assert "GHOST-BP-002" in ids
         assert "GHOST-BP-003" in ids
-        assert "GHOST-BP-004" in ids
         assert "GHOST-BP-005" in ids
         assert "GHOST-BP-006" in ids
 
     def test_rule_count(self):
-        assert len(registry.rules) >= 6
+        assert len(registry.rules) == 18
+
 
     def test_get_rule_by_id(self):
         r = registry.get_rule("GHOST-BP-001")
@@ -295,85 +290,7 @@ class TestBP003:
 
 
 # ==================================================================
-# Tests: GHOST-BP-004 — Deployment branches unprotected
-# ==================================================================
-
-class TestBP004:
-    def test_fires_when_deploy_branches_unprotected(self):
-        gate = make_gate(branch_protections=[
-            make_bp("main", reviews=2, enforce_admins=True),
-            # staging, production etc are NOT protected
-        ])
-        findings = registry.run_rules(
-            gate, attacker_level=AttackerLevel.REPO_WRITE,
-            rule_ids=["GHOST-BP-004"],
-        )
-        assert len(findings) == 1
-        assert "unprotected_deploy_branches" in findings[0].evidence
-        unprotected = findings[0].evidence["unprotected_deploy_branches"]
-        assert "staging" in unprotected
-        assert "production" in unprotected
-
-    def test_silent_when_no_default_protection(self):
-        """If default branch isn't protected, this isn't the right finding."""
-        gate = make_gate(branch_protections=[])
-        findings = registry.run_rules(
-            gate, attacker_level=AttackerLevel.REPO_WRITE,
-            rule_ids=["GHOST-BP-004"],
-        )
-        assert len(findings) == 0
-
-    def test_silent_when_default_has_no_reviews(self):
-        """Default branch protected but with 0 reviews → not a gap."""
-        gate = make_gate(branch_protections=[
-            make_bp("main", reviews=0),
-        ])
-        findings = registry.run_rules(
-            gate, attacker_level=AttackerLevel.REPO_WRITE,
-            rule_ids=["GHOST-BP-004"],
-        )
-        assert len(findings) == 0
-
-    def test_deploy_branches_from_environments(self):
-        """Detects deploy branches referenced by environment policies."""
-        gate = make_gate(
-            branch_protections=[
-                make_bp("main", reviews=1),
-            ],
-            environments=[
-                make_environment(
-                    "production",
-                    deployment_policy_type="selected",
-                    deployment_patterns=["release-v1"],
-                ),
-            ],
-        )
-        findings = registry.run_rules(
-            gate, attacker_level=AttackerLevel.REPO_WRITE,
-            rule_ids=["GHOST-BP-004"],
-        )
-        assert len(findings) == 1
-        unprotected = findings[0].evidence["unprotected_deploy_branches"]
-        assert "release-v1" in unprotected
-
-    def test_fewer_unprotected_when_staging_protected(self):
-        """Protected deploy branches are excluded from finding."""
-        gate = make_gate(branch_protections=[
-            make_bp("main", reviews=2),
-            make_bp("staging", reviews=1),
-        ])
-        findings = registry.run_rules(
-            gate, attacker_level=AttackerLevel.REPO_WRITE,
-            rule_ids=["GHOST-BP-004"],
-        )
-        assert len(findings) == 1
-        unprotected = findings[0].evidence["unprotected_deploy_branches"]
-        assert "staging" not in unprotected
-        assert "production" in unprotected
-
-
-# ==================================================================
-# Tests: GHOST-BP-005 — Workflows can approve own PRs
+# Tests: GHOST-BP-005 — Actions PR approval setting enabled
 # ==================================================================
 
 class TestBP005:
@@ -390,7 +307,7 @@ class TestBP005:
             rule_ids=["GHOST-BP-005"],
         )
         assert len(findings) == 1
-        assert findings[0].severity == Severity.HIGH
+        assert findings[0].severity == Severity.MEDIUM
         assert findings[0].evidence["can_approve_pull_request_reviews"] is True
 
     def test_silent_when_can_approve_disabled(self):
@@ -453,6 +370,18 @@ class TestBP006:
         assert len(findings) == 1
         assert findings[0].evidence["enforcement"] == "evaluate"
 
+    def test_multiple_evaluate_rulesets_have_distinct_instances(self):
+        gate = make_gate(rulesets=[
+            make_ruleset("same", ruleset_id=101, enforcement="evaluate"),
+            make_ruleset("same", ruleset_id=202, enforcement="evaluate"),
+        ])
+        findings = registry.run_rules(
+            gate, attacker_level=AttackerLevel.REPO_WRITE,
+            rule_ids=["GHOST-BP-006"],
+        )
+
+        assert {finding.instance for finding in findings} == {"101", "202"}
+
     def test_silent_on_active_mode(self):
         gate = make_gate(
             rulesets=[make_ruleset("main-rules", enforcement="active")],
@@ -473,8 +402,8 @@ class TestBP006:
         )
         assert len(findings) == 0
 
-    def test_higher_severity_without_branch_protection(self):
-        """Evaluate-mode ruleset as only protection → HIGH severity."""
+    def test_does_not_infer_absence_of_other_controls(self):
+        """Incomplete branch collection must not elevate the finding."""
         gate = make_gate(
             branch_protections=[],  # no real protection
             rulesets=[make_ruleset("main-rules", enforcement="evaluate")],
@@ -484,10 +413,11 @@ class TestBP006:
             rule_ids=["GHOST-BP-006"],
         )
         assert len(findings) == 1
-        assert findings[0].severity == Severity.HIGH
+        assert findings[0].severity == Severity.MEDIUM
+        assert "other" in " ".join(findings[0].gating_conditions).lower()
 
-    def test_lower_severity_with_branch_protection(self):
-        """Evaluate-mode alongside real protection → MEDIUM severity."""
+    def test_stays_medium_with_collected_branch_protection(self):
+        """Collected classic protection does not change evaluate-mode semantics."""
         gate = make_gate(
             branch_protections=[make_bp("main", reviews=1)],
             rulesets=[make_ruleset("main-rules", enforcement="evaluate")],
@@ -529,20 +459,18 @@ class TestBP006:
         assert "main" in findings[0].evidence["target_branches"]
 
 
-# ==================================================================
-# Tests: Finding quality checks
-# ==================================================================
-
 class TestFindingQuality:
-    """Verify that all findings have the required fields populated."""
+    """Verify meaningful output invariants for generated BP findings."""
 
     def _get_all_bp_findings(self) -> list[BypassFinding]:
-        """Run all BP rules against a maximally-vulnerable gate."""
         from ghostgates.models.gates import WorkflowPermissions
+
         gate = make_gate(
             branch_protections=[
-                make_bp("main", reviews=2, enforce_admins=False,
-                        dismiss_stale=False, codeowners=False),
+                make_bp(
+                    "main", reviews=2, enforce_admins=False,
+                    dismiss_stale=False, codeowners=False,
+                ),
             ],
             rulesets=[make_ruleset("eval", enforcement="evaluate")],
             workflow_permissions=WorkflowPermissions(
@@ -552,27 +480,26 @@ class TestFindingQuality:
         return registry.run_rules(gate, attacker_level=AttackerLevel.ORG_OWNER)
 
     def test_all_findings_have_rule_id(self):
-        for f in self._get_all_bp_findings():
-            assert f.rule_id.startswith("GHOST-BP-")
+        for finding in self._get_all_bp_findings():
+            assert finding.rule_id.startswith("GHOST-BP-")
 
     def test_all_findings_have_evidence(self):
-        for f in self._get_all_bp_findings():
-            assert isinstance(f.evidence, dict)
-            assert len(f.evidence) > 0
+        for finding in self._get_all_bp_findings():
+            assert isinstance(finding.evidence, dict)
+            assert finding.evidence
 
     def test_all_findings_have_remediation(self):
-        for f in self._get_all_bp_findings():
-            assert len(f.remediation) > 10
+        for finding in self._get_all_bp_findings():
+            assert len(finding.remediation) > 10
 
     def test_all_findings_have_bypass_path(self):
-        for f in self._get_all_bp_findings():
-            assert len(f.bypass_path) > 20
-            assert "1." in f.bypass_path  # numbered steps
+        for finding in self._get_all_bp_findings():
+            assert len(finding.bypass_path) > 20
 
     def test_all_findings_have_summary(self):
-        for f in self._get_all_bp_findings():
-            assert len(f.summary) > 10
+        for finding in self._get_all_bp_findings():
+            assert len(finding.summary) > 10
 
     def test_all_findings_have_repo(self):
-        for f in self._get_all_bp_findings():
-            assert "/" in f.repo  # org/repo format
+        for finding in self._get_all_bp_findings():
+            assert "/" in finding.repo

@@ -145,18 +145,24 @@ async def test_list_rulesets_404_returns_empty(client: GitHubClient, mock_router
 
 @pytest.mark.asyncio
 async def test_pagination_follows_link_header(client: GitHubClient, mock_router, base_url: str):
-    """get_paginated correctly parses and would follow Link: rel='next'.
-
-    Note: respx with base_url cannot match absolute URLs from Link headers,
-    so we test that single-page pagination works correctly and that link
-    parsing is correct (tested separately in test_parse_link_next_*).
-    """
-    # Single page with no next link — verifies basic pagination flow
-    mock_router.get("/orgs/org/repos").mock(
+    """get_paginated follows an absolute Link header and combines both pages."""
+    mock_router.get(
+        "/orgs/org/repos", params={"type": "all", "per_page": 100}
+    ).mock(
         return_value=httpx.Response(
             200,
-            json=[{"name": "repo1"}, {"name": "repo2"}],
-            headers=_rl_headers(),  # no Link header = single page
+            json=[{"name": "repo1"}],
+            headers={
+                **_rl_headers(),
+                "link": f'<{base_url}/orgs/org/repos?page=2>; rel="next"',
+            },
+        )
+    )
+    mock_router.get(f"{base_url}/orgs/org/repos?page=2").mock(
+        return_value=httpx.Response(
+            200,
+            json=[{"name": "repo2"}],
+            headers=_rl_headers(),
         )
     )
 
@@ -236,6 +242,23 @@ async def test_permission_403_raises_immediately(client: GitHubClient, mock_rout
     with pytest.raises(GitHubClientError, match="403"):
         await client.get("/forbidden")
 
+    assert client._rate_limiter._semaphore._value == 5
+
+
+@pytest.mark.asyncio
+async def test_paginated_permission_403_raises_immediately(client: GitHubClient, mock_router):
+    """Pagination does not mistake a permission failure for a rate limit."""
+    mock_router.get("/orgs/org/repos").mock(
+        return_value=httpx.Response(
+            403,
+            json={"message": "Resource not accessible by personal access token"},
+            headers=_rl_headers(remaining=4000),
+        )
+    )
+    with pytest.raises(GitHubClientError, match="403 Forbidden"):
+        await asyncio.wait_for(client.list_org_repos("org"), timeout=0.5)
+    assert client._rate_limiter._semaphore._value == 5
+
 
 # ------------------------------------------------------------------
 # Tests: token safety
@@ -254,6 +277,11 @@ def test_repr_masks_token():
 def test_scrub_removes_ghp_tokens():
     assert "ghp_" not in _scrub("error with ghp_abc123xyz token")
     assert "***" in _scrub("error with ghp_abc123xyz token")
+
+def test_scrub_removes_ghr_tokens():
+    scrubbed = _scrub("error with ghr_abc123xyz token")
+    assert "ghr_" not in scrubbed
+    assert "***" in scrubbed
 
 
 def test_scrub_removes_github_pat():
@@ -356,23 +384,6 @@ async def test_get_branch_protection_success(client: GitHubClient, mock_router):
     result = await client.get_branch_protection("org", "repo", "main")
     assert result is not None
     assert "required_pull_request_reviews" in result
-
-
-@pytest.mark.asyncio
-async def test_list_collaborators(client: GitHubClient, mock_router):
-    mock_router.get("/repos/org/repo/collaborators").mock(
-        return_value=httpx.Response(
-            200,
-            json=[
-                {"login": "alice", "id": 1, "permissions": {"admin": True}},
-                {"login": "bob", "id": 2, "permissions": {"push": True}},
-            ],
-            headers=_rl_headers(),
-        )
-    )
-    result = await client.list_collaborators("org", "repo")
-    assert len(result) == 2
-    assert result[0]["login"] == "alice"
 
 
 @pytest.mark.asyncio

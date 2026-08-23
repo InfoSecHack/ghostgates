@@ -11,6 +11,32 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 from ghostgates.models.enums import AttackerLevel, Confidence, GateType, Severity
+from ghostgates.models.gates import CollectionError
+
+
+class ScanScope(BaseModel):
+    """Repositories requested, discovered, selected, and evaluated by a scan."""
+
+    requested_repositories: list[str] | None = None
+    discovered_repositories: list[str] = Field(default_factory=list)
+    selected_repositories: list[str] = Field(default_factory=list)
+    evaluated_repositories: list[str] = Field(default_factory=list)
+    enumeration_complete: bool = False
+
+    @property
+    def is_complete(self) -> bool:
+        if not self.enumeration_complete:
+            return False
+        if set(self.selected_repositories) != set(self.evaluated_repositories):
+            return False
+        if self.requested_repositories is not None:
+            requested = set(self.requested_repositories)
+            return (
+                requested <= set(self.discovered_repositories)
+                and requested <= set(self.selected_repositories)
+            )
+        return True
+
 
 
 class BypassFinding(BaseModel):
@@ -49,9 +75,11 @@ class BypassFinding(BaseModel):
         # Branch name
         if "branch" in ev and not parts:
             parts.append(ev["branch"])
-        # Ruleset name
-        if "ruleset" in ev and not parts:
-            parts.append(ev["ruleset"])
+        # Ruleset IDs remain stable when a display name changes.
+        if "ruleset_id" in ev and not parts:
+            parts.append(str(ev["ruleset_id"]))
+        elif "ruleset_name" in ev and not parts:
+            parts.append(ev["ruleset_name"])
         if parts:
             self.instance = "#".join(parts)
 
@@ -85,10 +113,19 @@ class ScanResult(BaseModel):
     repos_scanned: int
     repos_skipped: int = 0                          # archived, forked, etc.
     findings: list[BypassFinding] = Field(default_factory=list)
-    errors: list[str] = Field(default_factory=list)
+    errors: list[CollectionError | str] = Field(default_factory=list)
+    scope: ScanScope | None = None
     scan_duration_seconds: float = 0.0
     attacker_level: AttackerLevel
     collected_at: str = ""
+
+    @property
+    def is_complete(self) -> bool:
+        return not self.errors and self.scope is not None and self.scope.is_complete
+
+    @property
+    def error_messages(self) -> list[str]:
+        return [str(error) for error in self.errors]
 
     @property
     def finding_count_by_severity(self) -> dict[str, int]:
