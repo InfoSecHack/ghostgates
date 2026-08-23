@@ -66,9 +66,14 @@ def format_terminal(result: ScanResult, *, verbose: bool = False) -> str:
     lines.append(severity_line)
     lines.append(f"  Total:    {len(result.findings)}")
     lines.append("")
+    if result.errors:
+        lines.append(f"  {_BOLD}INCOMPLETE: collection failed for part of the scan.{_RESET}")
+        for error in result.errors:
+            lines.append(f"    • {error}")
+        lines.append("")
 
     if not result.findings:
-        lines.append(f"  {_BOLD}✓ No bypass findings detected{_RESET}")
+        lines.append(f"  {_BOLD}No matching findings generated (not proof of absence){_RESET}")
         lines.append("")
         return "\n".join(lines)
 
@@ -160,6 +165,11 @@ def format_markdown(result: ScanResult) -> str:
     lines.append(f"**Attacker level:** {result.attacker_level}")
     lines.append(f"**Scan time:** {result.collected_at or 'now'}")
     lines.append("")
+    if result.errors:
+        lines.append("> **Incomplete scan:** collection failed for part of the scan.")
+        for error in result.errors:
+            lines.append(f"> - {error}")
+        lines.append("")
 
     # Summary table
     counts = _severity_counts(result.findings)
@@ -175,7 +185,7 @@ def format_markdown(result: ScanResult) -> str:
     lines.append("")
 
     if not result.findings:
-        lines.append("✅ No bypass findings detected.")
+        lines.append("No matching findings were generated; this is not proof of absence.")
         return "\n".join(lines)
 
     # Findings by repo

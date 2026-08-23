@@ -1,18 +1,10 @@
-"""
-ghostgates/client/rate_limiter.py
-
-Async rate limiter respecting GitHub's three rate limit layers:
-  1. Primary   — 5 000 req/hr tracked via x-ratelimit-* headers
-  2. Secondary — abuse detection triggered by 403/429 + retry-after
-  3. Concurrent — asyncio.Semaphore caps in-flight requests
-"""
+"""Concurrency limiting and response-based backoff for GitHub requests."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
 import time
-from typing import Optional
 
 logger = logging.getLogger("ghostgates.rate_limiter")
 
@@ -22,19 +14,13 @@ _SECONDARY_BACKOFF_CAP  = 300   # seconds — hard ceiling for exponential backo
 
 class RateLimiter:
     """
-    Respects GitHub's three rate limit layers:
-
-    1. Primary:    5 000 requests/hour (tracked via x-ratelimit-remaining)
-    2. Secondary:  points-per-minute   (tracked via retry-after header on 403/429)
-    3. Concurrent: max simultaneous requests (configurable, default 10)
-
-    All mutable state is guarded by ``_lock`` so concurrent asyncio tasks
-    never observe a torn write.
+    The semaphore caps in-flight requests. Response headers update primary
+    quota state and drive backoff after callers identify a rate-limit response.
+    This class does not predict GitHub's server-side secondary-limit policy.
     """
 
     def __init__(self, max_concurrent: int = 10) -> None:
         self._semaphore = asyncio.Semaphore(max_concurrent)
-        self._lock      = asyncio.Lock()
 
         # --- Primary limit state ---
         self._remaining: int        = 5_000   # assume full until told otherwise
@@ -83,11 +69,6 @@ class RateLimiter:
         if remaining_raw is None and reset_raw is None:
             return  # not a rate-limited endpoint; nothing to update
 
-        # Use a plain lock (non-async) because update_from_headers is sync.
-        # asyncio.Lock cannot be used from a synchronous context, but since
-        # asyncio is single-threaded, simple attribute assignment is already
-        # atomic at the Python level.  We document this as "safe for concurrent
-        # async tasks" — the GIL protects us here for integer/float writes.
         if remaining_raw is not None:
             try:
                 new_remaining = int(remaining_raw)

@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
+from ghostgates.models.findings import ScanScope
 from ghostgates.models.gates import (
+    CollectionError,
     GateModel,
     OIDCConfig,
     WorkflowPermissions,
@@ -21,7 +24,6 @@ from ghostgates.collectors.org import collect_org_metadata
 from ghostgates.collectors.repos import (
     collect_repos,
     collect_branch_protections,
-    collect_collaborators,
     collect_rulesets,
 )
 from ghostgates.collectors.environments import collect_environments
@@ -33,48 +35,71 @@ if TYPE_CHECKING:
 logger = logging.getLogger("ghostgates.collectors.assembly")
 
 
+@dataclass
+class CollectionResult:
+    """Gate models plus explicit completeness and collection scope."""
+
+    gate_models: list[GateModel]
+    errors: list[CollectionError]
+    scope: ScanScope
+
+
 async def collect_org_gate_models(
     client: GitHubClient,
     org: str,
     *,
     include_forks: bool = False,
     repo_filter: list[str] | None = None,
-) -> tuple[list[GateModel], list[str]]:
-    """Collect GateModels for all repos in an organization.
+) -> CollectionResult:
+    """Collect GateModels without treating inaccessible evidence as absent."""
+    requested = (
+        [f"{org}/{name}" for name in repo_filter]
+        if repo_filter is not None
+        else None
+    )
 
-    Args:
-        client: Authenticated GitHub API client.
-        org: Organization name.
-        include_forks: Whether to include forked repos (default: skip).
-        repo_filter: If set, only collect these repo names.
-
-    Returns:
-        Tuple of (gate_models, errors).
-        Errors are non-fatal — individual repo failures don't stop the scan.
-    """
-    errors: list[str] = []
-
-    # --- Org-level metadata (shared across all repos) ---
     org_meta = await collect_org_metadata(client, org)
+    org_errors: list[CollectionError] = list(
+        org_meta.get("collection_errors", [])
+    )
+    errors = list(org_errors)
 
-    # --- List repos ---
     try:
         raw_repos = await collect_repos(client, org)
     except Exception as exc:
-        return [], [f"Failed to list repos for org '{org}': {exc}"]
+        scope = ScanScope(
+            requested_repositories=requested,
+            enumeration_complete=False,
+        )
+        return CollectionResult(
+            gate_models=[],
+            errors=[*errors, CollectionError(
+                collector="repositories",
+                message=str(exc),
+            )],
+            scope=scope,
+        )
 
-    # --- Filter repos ---
+    discovered = [f"{org}/{repo['name']}" for repo in raw_repos]
     repos_to_scan = _filter_repos(raw_repos, include_forks, repo_filter)
+    selected = [f"{org}/{repo['name']}" for repo in repos_to_scan]
     skipped = len(raw_repos) - len(repos_to_scan)
+
+    if requested is not None:
+        for missing_repo in sorted(set(requested) - set(selected)):
+            errors.append(CollectionError(
+                collector="repository_filter",
+                repo=missing_repo,
+                message="requested repository was not selected for evaluation",
+            ))
 
     logger.info(
         "Scanning %d repos for org '%s' (%d skipped)",
         len(repos_to_scan), org, skipped,
     )
 
-    # --- Collect gate models concurrently ---
     tasks = [
-        _collect_single_repo(client, org, repo_data, org_meta)
+        _collect_single_repo(client, org, repo_data, org_meta, org_errors)
         for repo_data in repos_to_scan
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -82,20 +107,38 @@ async def collect_org_gate_models(
     gate_models: list[GateModel] = []
     for repo_data, result in zip(repos_to_scan, results):
         repo_name = repo_data.get("name", "?")
+        full_name = f"{org}/{repo_name}"
         if isinstance(result, Exception):
-            errors.append(f"Failed to collect {org}/{repo_name}: {result}")
-            logger.warning("Failed to collect %s/%s: %s", org, repo_name, result)
+            errors.append(CollectionError(
+                collector="repository",
+                repo=full_name,
+                message=str(result),
+            ))
+            logger.warning("Failed to collect %s: %s", full_name, result)
         elif isinstance(result, GateModel):
             gate_models.append(result)
+            errors.extend(
+                error for error in result.collection_errors if error.repo
+            )
         else:
-            errors.append(f"Unexpected result type for {org}/{repo_name}")
+            errors.append(CollectionError(
+                collector="repository",
+                repo=full_name,
+                message=f"unexpected result type: {type(result).__name__}",
+            ))
 
+    scope = ScanScope(
+        requested_repositories=requested,
+        discovered_repositories=discovered,
+        selected_repositories=selected,
+        evaluated_repositories=[model.full_name for model in gate_models],
+        enumeration_complete=True,
+    )
     logger.info(
         "Collection complete: %d gate models, %d errors",
         len(gate_models), len(errors),
     )
-
-    return gate_models, errors
+    return CollectionResult(gate_models=gate_models, errors=errors, scope=scope)
 
 
 async def _collect_single_repo(
@@ -103,6 +146,7 @@ async def _collect_single_repo(
     org: str,
     repo_data: dict,
     org_meta: dict,
+    shared_errors: list[CollectionError] | None = None,
 ) -> GateModel:
     """Build a complete GateModel for a single repository.
 
@@ -113,24 +157,53 @@ async def _collect_single_repo(
 
     logger.debug("Collecting gate model for %s/%s", org, repo_name)
 
-    # Run independent collectors concurrently
-    bp_task = collect_branch_protections(client, org, repo_name, default_branch)
-    env_task = collect_environments(client, org, repo_name)
-    wf_task = collect_workflows(client, org, repo_name)
-    collab_task = collect_collaborators(client, org, repo_name)
-    ruleset_task = collect_rulesets(client, org, repo_name)
-    repo_perms_task = _collect_repo_actions_permissions(client, org, repo_name)
+    collector_names = (
+        "branch_protections",
+        "environments",
+        "workflows",
+        "rulesets",
+        "actions_permissions",
+    )
+    empty_values = ([], [], [], [], {})
+    results = await asyncio.gather(
+        collect_branch_protections(client, org, repo_name, default_branch),
+        collect_environments(client, org, repo_name),
+        collect_workflows(client, org, repo_name),
+        collect_rulesets(client, org, repo_name),
+        _collect_repo_actions_permissions(client, org, repo_name),
+        return_exceptions=True,
+    )
+
+    values: list = []
+    collection_errors = list(shared_errors or [])
+    for collector, result, empty_value in zip(
+        collector_names, results, empty_values
+    ):
+        if isinstance(result, Exception):
+            collection_errors.append(CollectionError(
+                collector=collector,
+                repo=f"{org}/{repo_name}",
+                message=str(result),
+            ))
+            values.append(empty_value)
+        else:
+            values.append(result)
 
     (
         branch_protections,
         environments,
         workflows,
-        collaborators,
         rulesets,
         repo_actions_perms,
-    ) = await asyncio.gather(
-        bp_task, env_task, wf_task, collab_task, ruleset_task, repo_perms_task
-    )
+    ) = values
+
+    for workflow in workflows:
+        for parse_error in workflow.parse_errors:
+            collection_errors.append(CollectionError(
+                collector="workflows",
+                repo=f"{org}/{repo_name}",
+                message=f"{workflow.path}: {parse_error}",
+            ))
 
     # --- Build workflow permissions from org + repo level ---
     workflow_permissions = _build_workflow_permissions(
@@ -155,7 +228,7 @@ async def _collect_single_repo(
         workflow_permissions=workflow_permissions,
         workflows=workflows,
         oidc=oidc,
-        collaborators=collaborators,
+        collection_errors=collection_errors,
         collected_at=datetime.now(timezone.utc),
     )
 
@@ -165,15 +238,8 @@ async def _collect_repo_actions_permissions(
     owner: str,
     repo: str,
 ) -> dict:
-    """Fetch repo-level Actions permissions. Returns empty dict on failure."""
-    try:
-        return await client.get_repo_actions_permissions(owner, repo)
-    except Exception as exc:
-        logger.debug(
-            "Error collecting repo Actions permissions for %s/%s: %s",
-            owner, repo, exc,
-        )
-        return {}
+    """Fetch repo-level Actions permissions."""
+    return await client.get_repo_actions_permissions(owner, repo)
 
 
 def _filter_repos(
@@ -202,10 +268,9 @@ def _build_workflow_permissions(
 
     Repo-level overrides org-level where both are present.
     """
-    # Start with org defaults
-    default_wf_perms = org_perms.get(
+    default_wf_perms = repo_perms.get(
         "default_workflow_permissions",
-        repo_perms.get("default_workflow_permissions", "read"),
+        org_perms.get("default_workflow_permissions", "read"),
     )
     can_approve = repo_perms.get(
         "can_approve_pull_request_reviews",

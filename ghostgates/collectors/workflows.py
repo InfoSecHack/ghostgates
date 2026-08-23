@@ -48,11 +48,7 @@ async def collect_workflows(
     Lists .github/workflows/ directory, fetches each .yml/.yaml file,
     and parses it. Returns partial results if some files fail.
     """
-    try:
-        files = await client.list_workflow_files(owner, repo)
-    except Exception as exc:
-        logger.debug("Error listing workflows for %s/%s: %s", owner, repo, exc)
-        return []
+    files = await client.list_workflow_files(owner, repo)
 
     if not files:
         return []

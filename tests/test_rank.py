@@ -191,13 +191,13 @@ class TestRankTerminalFormatter:
         output = format_rank_terminal([], "test-org")
         assert "No findings to rank" in output
 
-    def test_shows_repo_and_score(self):
+    def test_shows_repo_and_priority_points(self):
         scores = score_repos([
             _finding(repo="org/payments", severity=Severity.CRITICAL),
         ])
         output = format_rank_terminal(scores, "org")
         assert "payments" in output
-        assert "Risk Ranking" in output
+        assert "Review Priority" in output
 
     def test_shows_flags(self):
         scores = score_repos([
@@ -227,7 +227,8 @@ class TestRankTerminalFormatter:
                      min_privilege=AttackerLevel.EXTERNAL),
         ])
         output = format_rank_terminal(scores, "org")
-        assert "Total risk" in output
+        assert "Total priority points" in output
+        assert "not calibrated risk" in output
 
 
 # ── JSON formatter ───────────────────────────────────────────────
@@ -243,7 +244,7 @@ class TestRankJsonFormatter:
         parsed = json.loads(output)
         assert parsed["repos_ranked"] == 2
         assert parsed["rankings"][0]["rank"] == 1
-        assert parsed["rankings"][0]["score"] > parsed["rankings"][1]["score"]
+        assert parsed["rankings"][0]["priority_points"] > parsed["rankings"][1]["priority_points"]
 
     def test_includes_flags(self):
         scores = score_repos([
@@ -259,10 +260,11 @@ class TestRankJsonFormatter:
         assert r["has_external_path"] is True
         assert r["has_oidc_finding"] is True
 
-    def test_total_risk_score(self):
+    def test_total_priority_points_discloses_method(self):
         scores = score_repos([
             _finding(repo="org/a", severity=Severity.HIGH),
             _finding(repo="org/b", severity=Severity.MEDIUM),
         ])
         parsed = json.loads(format_rank_json(scores, "org"))
-        assert parsed["total_risk_score"] == 20 + 7
+        assert parsed["total_priority_points"] == 20 + 7
+        assert parsed["scoring_method"] == "uncalibrated-review-priority-v1"

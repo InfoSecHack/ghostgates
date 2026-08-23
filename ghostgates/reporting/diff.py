@@ -1,7 +1,8 @@
 """
 ghostgates/reporting/diff.py
 
-Compare two scan results and report new, resolved, and unchanged findings.
+Compare two scan results and report new, resolved, changed, unverified,
+and unchanged findings.
 Used by the `ghostgates diff` CLI command for drift detection.
 """
 
@@ -12,15 +13,79 @@ from dataclasses import dataclass, field
 from ghostgates.models.findings import BypassFinding, ScanResult
 
 
-def _finding_key(f: BypassFinding) -> str:
-    """Stable unique key for a finding instance.
+_DISPLAY_ONLY_EVIDENCE = {"ruleset_name", "workflow_name"}
 
-    Combines rule_id + repo + instance to identify the same finding
-    across scans.  If instance is empty, falls back to rule_id + repo
-    which means findings without instance keys will match by rule alone
-    (acceptable — same rule on same repo is the same finding).
-    """
+
+def _finding_key(f: BypassFinding) -> str:
+    """Stable unique key for a finding instance."""
     return f"{f.rule_id}|{f.repo}|{f.instance}"
+
+
+def _canonical(value):
+    if isinstance(value, dict):
+        return tuple(
+            (key, _canonical(item))
+            for key, item in sorted(value.items())
+            if key not in _DISPLAY_ONLY_EVIDENCE
+        )
+    if isinstance(value, list):
+        return tuple(_canonical(item) for item in value)
+    return value
+
+
+def _material_signature(finding: BypassFinding) -> tuple:
+    """Fields whose change can alter interpretation or remediation priority."""
+    return (
+        finding.severity,
+        finding.confidence,
+        finding.min_privilege,
+        finding.gate_type,
+        tuple(sorted(finding.gating_conditions)),
+        _canonical(finding.evidence),
+    )
+
+
+def _repo_was_evaluated(result: ScanResult, repo: str) -> bool:
+    """Whether a missing finding can safely be interpreted as resolved."""
+    if result.scope is None or not result.scope.enumeration_complete:
+        return False
+    if repo not in result.scope.selected_repositories:
+        return False
+    if repo not in result.scope.evaluated_repositories:
+        return False
+    for error in result.errors:
+        if isinstance(error, str) or not error.repo or error.repo == repo:
+            return False
+    return True
+
+
+@dataclass
+class FindingChange:
+    """The same finding instance with materially changed modeled details."""
+
+    old: BypassFinding
+    new: BypassFinding
+
+
+def _change_summary(change: FindingChange) -> str:
+    changes: list[str] = []
+    for attribute, label in (
+        ("severity", "severity"),
+        ("confidence", "confidence"),
+        ("min_privilege", "attacker prerequisite"),
+        ("gate_type", "gate type"),
+    ):
+        old_value = getattr(change.old, attribute)
+        new_value = getattr(change.new, attribute)
+        if old_value != new_value:
+            changes.append(
+                f"{label} {old_value.value.upper()} → {new_value.value.upper()}"
+            )
+    if sorted(change.old.gating_conditions) != sorted(change.new.gating_conditions):
+        changes.append("gating conditions changed")
+    if _canonical(change.old.evidence) != _canonical(change.new.evidence):
+        changes.append("evidence changed")
+    return ", ".join(changes)
 
 
 @dataclass
@@ -35,15 +100,31 @@ class ScanDiff:
 
     new_findings: list[BypassFinding] = field(default_factory=list)
     resolved_findings: list[BypassFinding] = field(default_factory=list)
+    changed_findings: list[FindingChange] = field(default_factory=list)
+    unverified_findings: list[BypassFinding] = field(default_factory=list)
     unchanged_findings: list[BypassFinding] = field(default_factory=list)
 
     @property
     def has_changes(self) -> bool:
-        return bool(self.new_findings or self.resolved_findings)
+        return bool(
+            self.new_findings
+            or self.resolved_findings
+            or self.changed_findings
+            or self.unverified_findings
+        )
 
 
-def diff_scans(old: ScanResult, new: ScanResult) -> ScanDiff:
+def diff_scans(
+    old: ScanResult,
+    new: ScanResult,
+    *,
+    evaluated_rule_ids: set[str] | None = None,
+) -> ScanDiff:
     """Compare two scan results and categorize findings."""
+    if evaluated_rule_ids is None:
+        from ghostgates.engine import registry
+        evaluated_rule_ids = {rule.rule_id for rule in registry.enabled_rules}
+
     old_by_key = {_finding_key(f): f for f in old.findings}
     new_by_key = {_finding_key(f): f for f in new.findings}
 
@@ -62,10 +143,22 @@ def diff_scans(old: ScanResult, new: ScanResult) -> ScanDiff:
         result.new_findings.append(new_by_key[key])
 
     for key in sorted(old_keys - new_keys):
-        result.resolved_findings.append(old_by_key[key])
+        old_finding = old_by_key[key]
+        if (
+            old_finding.rule_id not in evaluated_rule_ids
+            or not _repo_was_evaluated(new, old_finding.repo)
+        ):
+            result.unverified_findings.append(old_finding)
+        else:
+            result.resolved_findings.append(old_finding)
 
     for key in sorted(old_keys & new_keys):
-        result.unchanged_findings.append(new_by_key[key])
+        old_finding = old_by_key[key]
+        new_finding = new_by_key[key]
+        if _material_signature(old_finding) != _material_signature(new_finding):
+            result.changed_findings.append(FindingChange(old_finding, new_finding))
+        else:
+            result.unchanged_findings.append(new_finding)
 
     return result
 
@@ -102,6 +195,10 @@ def format_diff_terminal(d: ScanDiff) -> str:
         parts.append(f"{_RED}+{len(d.new_findings)} new{_RESET}")
     if d.resolved_findings:
         parts.append(f"{_GREEN}-{len(d.resolved_findings)} resolved{_RESET}")
+    if d.changed_findings:
+        parts.append(f"{_YELLOW}{len(d.changed_findings)} changed{_RESET}")
+    if d.unverified_findings:
+        parts.append(f"{_YELLOW}{len(d.unverified_findings)} unverified{_RESET}")
     parts.append(f"{len(d.unchanged_findings)} unchanged")
 
     lines.append(f"  {' │ '.join(parts)}")
@@ -136,6 +233,28 @@ def format_diff_terminal(d: ScanDiff) -> str:
             )
             lines.append(f"      {_DIM}{f.summary}{_RESET}")
 
+    if d.changed_findings:
+        lines.append("")
+        lines.append(f"  {_YELLOW}{_BOLD}── Changed Findings ──{_RESET}")
+        for change in d.changed_findings:
+            f = change.new
+            instance_tag = f" ({f.instance})" if f.instance else ""
+            lines.append(
+                f"    {_YELLOW}~ {f.rule_id}{instance_tag}: "
+                f"{_change_summary(change)}{_RESET}"
+            )
+
+    if d.unverified_findings:
+        lines.append("")
+        lines.append(f"  {_YELLOW}{_BOLD}── Unverified Findings ──{_RESET}")
+        lines.append("    Not reported by an incomplete scan or no longer evaluated.")
+        for f in d.unverified_findings:
+            instance_tag = f" ({f.instance})" if f.instance else ""
+            lines.append(
+                f"    {_YELLOW}? [{f.severity.value.upper()}] "
+                f"{f.rule_id}{instance_tag}: {f.rule_name}{_RESET}"
+            )
+
     lines.append("")
     return "\n".join(lines)
 
@@ -152,10 +271,20 @@ def format_diff_json(d: ScanDiff) -> str:
             "summary": {
                 "new": len(d.new_findings),
                 "resolved": len(d.resolved_findings),
+                "changed": len(d.changed_findings),
+                "unverified": len(d.unverified_findings),
                 "unchanged": len(d.unchanged_findings),
             },
             "new_findings": [f.model_dump(mode="json") for f in d.new_findings],
             "resolved_findings": [f.model_dump(mode="json") for f in d.resolved_findings],
+            "changed_findings": [
+                {
+                    "old": change.old.model_dump(mode="json"),
+                    "new": change.new.model_dump(mode="json"),
+                }
+                for change in d.changed_findings
+            ],
+            "unverified_findings": [f.model_dump(mode="json") for f in d.unverified_findings],
         },
         indent=2,
     )
@@ -170,6 +299,8 @@ def format_diff_markdown(d: ScanDiff) -> str:
     lines.append(f"|--------|-------|")
     lines.append(f"| 🆕 New findings | {len(d.new_findings)} |")
     lines.append(f"| ✅ Resolved | {len(d.resolved_findings)} |")
+    lines.append(f"| 🔄 Changed | {len(d.changed_findings)} |")
+    lines.append(f"| ⚠️ Unverified | {len(d.unverified_findings)} |")
     lines.append(f"| ➡️ Unchanged | {len(d.unchanged_findings)} |")
     lines.append("")
 
@@ -187,6 +318,26 @@ def format_diff_markdown(d: ScanDiff) -> str:
         for f in d.resolved_findings:
             instance_tag = f" ({f.instance})" if f.instance else ""
             lines.append(f"- ~~[{f.severity.value.upper()}] {f.rule_id}{instance_tag}~~: {f.summary}")
+        lines.append("")
+
+    if d.changed_findings:
+        lines.append("## 🔄 Changed Findings")
+        lines.append("")
+        for change in d.changed_findings:
+            f = change.new
+            instance_tag = f" ({f.instance})" if f.instance else ""
+            lines.append(
+                f"- **{f.rule_id}{instance_tag}**: {_change_summary(change)}"
+            )
+        lines.append("")
+
+    if d.unverified_findings:
+        lines.append("## ⚠️ Unverified Findings")
+        lines.append("")
+        lines.append("These were not reported by an incomplete scan or are no longer evaluated.")
+        for f in d.unverified_findings:
+            instance_tag = f" ({f.instance})" if f.instance else ""
+            lines.append(f"- **{f.rule_id}{instance_tag}**: {f.summary}")
         lines.append("")
 
     if not d.has_changes:

@@ -5,6 +5,8 @@ Environment protection bypass rules (GHOST-ENV-001 through GHOST-ENV-003).
 """
 
 from __future__ import annotations
+import re
+
 
 from ghostgates.engine.registry import registry
 from ghostgates.engine.urls import environment_url
@@ -30,43 +32,44 @@ from ghostgates.models.findings import BypassFinding
     tags=("environment", "deployment"),
 )
 def env_001_no_reviewers(gate: GateModel) -> list[BypassFinding]:
-    """Detects environments that have no required reviewers.
-
-    Impact: Any workflow that references this environment can deploy
-    without human approval. If the environment holds secrets or
-    controls production access, this is a direct path to unreviewed
-    deployment.
-
-    Only fires for environments that appear security-relevant:
-    production, staging, or environments with secrets/custom rules.
-    """
+    """Detect relevant environments with no reviewer or other collected gate."""
     findings: list[BypassFinding] = []
 
     for env in gate.environments:
-        if env.reviewers:
-            continue  # has reviewers — fine
+        # Custom protection rule behavior is not collected, so its presence
+        # cannot prove equivalence to reviewer approval.
+        if env.reviewers or env.wait_timer:
+            continue
 
         # Only flag environments that look security-relevant
         if not _is_security_relevant_env(env):
             continue
 
+        custom_rule_observation = (
+            f"Observed: {len(env.custom_rules)} custom protection rule(s); "
+            "their behavior is unmodeled"
+            if env.custom_rules
+            else "Observed: no custom protection rules"
+        )
         findings.append(BypassFinding(
             rule_id="GHOST-ENV-001",
             rule_name="Environment with no required reviewers",
             repo=gate.full_name,
             gate_type=GateType.ENVIRONMENT,
-            severity=Severity.HIGH,
-            confidence=Confidence.HIGH,
+            severity=Severity.MEDIUM,
+            confidence=(Confidence.MEDIUM if env.custom_rules else Confidence.HIGH),
             min_privilege=AttackerLevel.REPO_WRITE,
             summary=(
-                f"Environment '{env.name}' has no required reviewers — "
-                f"deployments proceed without human approval."
+                f"Environment '{env.name}' has no required reviewers; "
+                f"GitHub reviewer approval is not configured."
             ),
             bypass_path=(
-                f"1. Environment '{env.name}' in {gate.full_name} has zero required reviewers\n"
-                f"2. Any workflow referencing this environment deploys without approval\n"
-                f"3. Attacker with write access triggers workflow targeting '{env.name}'\n"
-                f"4. Deployment executes immediately with no human gate"
+                f"Observed: environment '{env.name}' has no required reviewers "
+                f"or wait timer\n"
+                f"{custom_rule_observation}\n"
+                f"Unobserved prerequisite: a reachable workflow job uses this environment\n"
+                f"Potential consequence: that job has no approval step supplied by the "
+                f"GitHub environment"
             ),
             evidence={
                 "environment": env.name,
@@ -76,8 +79,9 @@ def env_001_no_reviewers(gate: GateModel) -> list[BypassFinding]:
                 "has_custom_rules": len(env.custom_rules) > 0,
             },
             gating_conditions=[
-                "Attacker must have write access to trigger a workflow",
+                "Attacker must be able to trigger the relevant workflow job",
                 f"A workflow must reference the '{env.name}' environment",
+                "Any custom protection rule must not independently enforce equivalent approval",
             ],
             remediation=(
                 f"Add required reviewers to the '{env.name}' environment. "
@@ -106,16 +110,7 @@ def env_001_no_reviewers(gate: GateModel) -> list[BypassFinding]:
     tags=("environment", "deployment", "branch-policy"),
 )
 def env_002_any_branch_deploy(gate: GateModel) -> list[BypassFinding]:
-    """Detects environments where deployment_branch_policy allows all branches.
-
-    Impact: An attacker with write access can create a branch with
-    malicious code and deploy it to the environment, bypassing any
-    branch protection on main/develop. This is the most common
-    environment misconfiguration.
-
-    Only fires for environments with reviewers (if no reviewers,
-    ENV-001 already covers it as higher severity).
-    """
+    """Detect reviewer-gated environments that accept jobs from any branch."""
     findings: list[BypassFinding] = []
 
     for env in gate.environments:
@@ -135,20 +130,20 @@ def env_002_any_branch_deploy(gate: GateModel) -> list[BypassFinding]:
             repo=gate.full_name,
             gate_type=GateType.ENVIRONMENT,
             severity=Severity.MEDIUM,
-            confidence=Confidence.HIGH,
+            confidence=Confidence.MEDIUM,
             min_privilege=AttackerLevel.REPO_WRITE,
             summary=(
                 f"Environment '{env.name}' has required reviewers but allows "
-                f"deployment from any branch — attacker can deploy from an "
-                f"unprotected branch."
+                f"deployment jobs from any branch; branch protection is not itself "
+                f"a source restriction."
             ),
             bypass_path=(
-                f"1. Environment '{env.name}' requires {len(env.reviewers)} reviewer(s)\n"
-                f"2. deployment_branch_policy is 'all' — any branch can deploy\n"
-                f"3. Attacker creates a feature branch with malicious code\n"
-                f"4. Attacker triggers workflow from that branch targeting '{env.name}'\n"
-                f"5. Reviewer sees the deployment request but may not review "
-                f"the source branch (which has no protection rules)"
+                f"Observed: environment '{env.name}' requires {len(env.reviewers)} reviewer(s)\n"
+                f"Observed: deployment_branch_policy is 'all'\n"
+                f"Unobserved prerequisite: a reachable workflow permits this environment "
+                f"from an attacker-controlled branch\n"
+                f"Potential consequence: environment approval can be requested from a "
+                f"branch outside the intended protected-branch flow"
             ),
             evidence={
                 "environment": env.name,
@@ -159,6 +154,7 @@ def env_002_any_branch_deploy(gate: GateModel) -> list[BypassFinding]:
             gating_conditions=[
                 "Attacker must have write access to create branches",
                 "Reviewer must approve the deployment (social engineering or inattention)",
+                "A relevant workflow must be triggerable from the attacker's branch",
             ],
             remediation=(
                 f"Set deployment_branch_policy on '{env.name}' to "
@@ -174,24 +170,18 @@ def env_002_any_branch_deploy(gate: GateModel) -> list[BypassFinding]:
 
 
 # ==================================================================
-# GHOST-ENV-003: Wait timer as only protection (auto-approve)
+# GHOST-ENV-003: Wait timer without required reviewers
 # ==================================================================
 
 @registry.rule(
     rule_id="GHOST-ENV-003",
-    name="Wait timer as only environment protection",
+    name="Wait timer without reviewer approval",
     gate_type=GateType.ENVIRONMENT,
     min_privilege=AttackerLevel.REPO_WRITE,
     tags=("environment", "deployment", "wait-timer"),
 )
 def env_003_wait_timer_only(gate: GateModel) -> list[BypassFinding]:
-    """Detects environments where a wait timer is the only protection.
-
-    Impact: Wait timers delay deployment but don't require human approval.
-    After the timer expires, the deployment proceeds automatically.
-    If no reviewers are configured, the wait timer creates a false
-    sense of security — it's a speed bump, not a gate.
-    """
+    """Detect relevant environments with a timer but no reviewer approval."""
     findings: list[BypassFinding] = []
 
     for env in gate.environments:
@@ -199,38 +189,47 @@ def env_003_wait_timer_only(gate: GateModel) -> list[BypassFinding]:
             continue
 
         if env.reviewers:
-            continue  # has real reviewers — wait timer is additive
+            continue
 
         if not _is_security_relevant_env(env):
             continue
 
+        custom_rule_observation = (
+            f"Observed: {len(env.custom_rules)} custom protection rule(s); "
+            "their behavior is unmodeled"
+            if env.custom_rules
+            else "Observed: no custom protection rules"
+        )
         findings.append(BypassFinding(
             rule_id="GHOST-ENV-003",
-            rule_name="Wait timer as only environment protection",
+            rule_name="Wait timer without reviewer approval",
             repo=gate.full_name,
             gate_type=GateType.ENVIRONMENT,
             severity=Severity.MEDIUM,
-            confidence=Confidence.HIGH,
+            confidence=(Confidence.MEDIUM if env.custom_rules else Confidence.HIGH),
             min_privilege=AttackerLevel.REPO_WRITE,
             summary=(
                 f"Environment '{env.name}' has a {env.wait_timer}-minute wait timer "
-                f"but no required reviewers — deployment auto-approves after the timer."
+                f"but no required reviewers."
             ),
             bypass_path=(
-                f"1. Environment '{env.name}' has a {env.wait_timer}-minute wait timer\n"
-                f"2. No required reviewers are configured\n"
-                f"3. Attacker triggers deployment workflow\n"
-                f"4. After {env.wait_timer} minutes, deployment proceeds automatically\n"
-                f"5. No human ever reviews or approves the deployment"
+                f"Observed: environment '{env.name}' has a {env.wait_timer}-minute wait timer\n"
+                f"Observed: no required reviewers are configured\n"
+                f"{custom_rule_observation}\n"
+                f"Unobserved prerequisite: a reachable workflow job uses this environment\n"
+                f"Potential consequence: after the timer, the environment supplies no "
+                f"human approval step"
             ),
             evidence={
                 "environment": env.name,
                 "wait_timer": env.wait_timer,
                 "reviewer_count": 0,
+                "has_custom_rules": bool(env.custom_rules),
             },
             gating_conditions=[
-                "Attacker must have write access to trigger a workflow",
-                f"Attacker must wait {env.wait_timer} minutes for auto-approval",
+                "Attacker must be able to trigger the relevant workflow job",
+                f"The job must remain eligible through the {env.wait_timer}-minute wait",
+                "Any custom protection rule must not independently enforce equivalent approval",
             ],
             remediation=(
                 f"Add required reviewers to the '{env.name}' environment. "
@@ -260,10 +259,8 @@ _SECURITY_RELEVANT_NAMES = {
 def _is_security_relevant_env(env) -> bool:
     """Determine if an environment name suggests security relevance.
 
-    Returns True for:
-      - Names matching known patterns (production, staging, etc.)
-      - Environments with custom protection rules
-      - Environments with secrets
+    Names are matched as tokens to avoid treating names such as ``livereload``
+    or ``stagecoach`` as production-like environments.
     """
     name_lower = env.name.lower().strip()
 
@@ -271,17 +268,12 @@ def _is_security_relevant_env(env) -> bool:
     if name_lower in _SECURITY_RELEVANT_NAMES:
         return True
 
-    # Partial match (e.g., "aws-production", "gcp-staging")
-    for pattern in _SECURITY_RELEVANT_NAMES:
-        if pattern in name_lower:
-            return True
+    tokens = set(re.split(r"[^a-z0-9]+", name_lower))
+    if tokens & _SECURITY_RELEVANT_NAMES:
+        return True
 
     # Has custom protection rules → probably important
     if env.custom_rules:
-        return True
-
-    # Has secrets → probably important
-    if env.has_secrets:
         return True
 
     return False

@@ -1,10 +1,5 @@
 """
-Tests for GHOST-WF-005 through GHOST-WF-008 (supply chain rules).
-
-Inspired by the March 2026 Trivy attack:
-- Stolen PAT + workflow vulnerability → repo takeover
-- Deleted releases, published malicious VSIX extension
-- Part of campaign hitting Microsoft, DataDog, CNCF
+Tests for GHOST-WF-005 through GHOST-WF-008.
 """
 
 from __future__ import annotations
@@ -16,6 +11,8 @@ from ghostgates.models.enums import AttackerLevel, GateType, Severity
 from ghostgates.models.gates import WorkflowPermissions
 
 from tests.mocks.gate_models import (
+    make_environment,
+    make_reviewer,
     make_gate,
     make_job,
     make_step,
@@ -46,7 +43,7 @@ class TestWF005:
             rule_ids=["GHOST-WF-005"],
         )
         assert len(findings) == 1
-        assert findings[0].severity == Severity.HIGH
+        assert findings[0].severity == Severity.MEDIUM
         assert "some-org/some-action@v2" in findings[0].evidence["unpinned_refs"]
 
     def test_silent_when_pinned_to_sha(self):
@@ -56,7 +53,7 @@ class TestWF005:
                 triggers=[make_trigger("push")],
                 jobs=[make_job(steps=[
                     make_step(uses="actions/checkout@v3"),
-                    make_step(uses="some-org/some-action@abcdef1234567890abcdef1234567890abcdef12"),
+                    make_step(uses="some-org/some-action@ABCDEF1234567890ABCDEF1234567890ABCDEF12"),
                 ])],
             ),
         ])
@@ -66,8 +63,8 @@ class TestWF005:
         )
         assert len(findings) == 0
 
-    def test_skips_first_party_actions(self):
-        """actions/ and github/ org actions are lower risk."""
+    def test_skips_first_party_and_same_org_references(self):
+        """The third-party rule does not relabel in-boundary references."""
         gate = make_gate(workflows=[
             make_workflow(
                 path=".github/workflows/ci.yml",
@@ -76,7 +73,11 @@ class TestWF005:
                     make_step(uses="actions/checkout@v3"),
                     make_step(uses="actions/setup-node@v4"),
                     make_step(uses="actions/upload-artifact@v4"),
-                ])],
+                    make_step(uses="test-org/internal-action@v1"),
+                ]), make_job(
+                    name="local-reuse",
+                    uses="./.github/workflows/build.yml",
+                )],
             ),
         ])
         findings = registry.run_rules(
@@ -183,7 +184,7 @@ class TestWF006:
             rule_ids=["GHOST-WF-006"],
         )
         assert len(findings) == 1
-        assert findings[0].severity == Severity.HIGH
+        assert findings[0].severity == Severity.MEDIUM
         assert "workflow_dispatch" in findings[0].evidence["trigger"]
 
     def test_fires_dispatch_inheriting_write_default(self):
@@ -277,7 +278,7 @@ class TestWF007:
         assert len(findings) == 1
         assert "contents:write" in findings[0].summary
 
-    def test_silent_contents_write_with_env(self):
+    def test_named_env_without_reviewers_still_fires(self):
         gate = make_gate(workflows=[
             make_workflow(
                 path=".github/workflows/release.yml",
@@ -292,7 +293,30 @@ class TestWF007:
             gate, attacker_level=AttackerLevel.REPO_WRITE,
             rule_ids=["GHOST-WF-007"],
         )
+        assert len(findings) == 1
+    def test_reviewer_gated_env_suppresses_finding(self):
+        gate = make_gate(
+            environments=[
+                make_environment("production", reviewers=[make_reviewer()]),
+            ],
+            workflows=[
+                make_workflow(
+                    path=".github/workflows/release.yml",
+                    triggers=[make_trigger("push")],
+                    jobs=[make_job(
+                        permissions={"contents": "write"},
+                        environment="production",
+                    )],
+                ),
+            ],
+        )
+        findings = registry.run_rules(
+            gate, attacker_level=AttackerLevel.REPO_WRITE,
+            rule_ids=["GHOST-WF-007"],
+        )
         assert len(findings) == 0
+
+
 
     def test_fires_write_all_no_env(self):
         gate = make_gate(workflows=[
@@ -433,7 +457,7 @@ class TestWF008:
         assert len(findings) == 1
 
     def test_fires_vsce_publish(self):
-        """The exact attack vector used against Trivy's VSIX."""
+        """Recognizes the VS Code extension publish command."""
         gate = make_gate(workflows=[
             make_workflow(
                 path=".github/workflows/vscode-ext.yml",
@@ -466,7 +490,9 @@ class TestWF008:
         assert len(findings) == 1
 
     def test_silent_publish_with_env_gate(self):
-        gate = make_gate(workflows=[
+        gate = make_gate(environments=[
+            make_environment("production", reviewers=[make_reviewer()]),
+        ], workflows=[
             make_workflow(
                 path=".github/workflows/publish.yml",
                 triggers=[make_trigger("push")],
@@ -492,6 +518,7 @@ class TestWF008:
                 jobs=[make_job(steps=[
                     make_step(run="npm test"),
                     make_step(run="npm run lint"),
+                    make_step(uses="docker/build-push-action@v5", with_={"push": False}),
                 ])],
             ),
         ])
@@ -523,7 +550,7 @@ class TestWF008:
                 path=".github/workflows/publish.yml",
                 triggers=[make_trigger("push")],
                 jobs=[make_job(steps=[
-                    make_step(uses="docker/build-push-action@v5"),
+                    make_step(uses="docker/build-push-action@v5", with_={"push": True}),
                     make_step(run="npm publish"),
                 ])],
             ),

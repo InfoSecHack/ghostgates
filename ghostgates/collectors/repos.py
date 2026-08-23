@@ -1,8 +1,7 @@
 """
 ghostgates/collectors/repos.py
 
-Collect repository-level data: repo list, branch protections, collaborators,
-and rulesets.
+Collect repository-level data: repo list, branch protections, and rulesets.
 """
 
 from __future__ import annotations
@@ -10,8 +9,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from ghostgates.config import DEFAULT_BRANCHES_TO_CHECK
-from ghostgates.models.gates import BranchProtection, Collaborator, Ruleset
+from ghostgates.models.gates import BranchProtection, Ruleset
 
 if TYPE_CHECKING:
     from ghostgates.client.github_client import GitHubClient
@@ -58,53 +56,25 @@ async def collect_branch_protections(
     repo: str,
     default_branch: str,
 ) -> list[BranchProtection]:
-    """Collect branch protection rules for the default branch + common branches.
+    """Collect the default branch's classic branch-protection rule.
 
-    Checks the default branch first, then other well-known branch names.
-    Branches that return 404 (no protection) are silently skipped.
-    Duplicate branch names are deduplicated.
+    The repository API response identifies the default branch. GhostGates does
+    not enumerate all branches, so probing guessed branch names would not
+    establish either branch existence or complete protection coverage.
     """
-    branches_to_check: list[str] = _unique_branches(default_branch)
-    protections: list[BranchProtection] = []
-    seen: set[str] = set()
+    raw = await client.get_branch_protection(owner, repo, default_branch)
+    if raw is None:
+        return []
 
-    for branch in branches_to_check:
-        if branch in seen:
-            continue
-        seen.add(branch)
+    bp = _parse_branch_protection(default_branch, raw)
+    logger.debug(
+        "Collected branch protection for %s/%s:%s (reviews=%d, enforce_admins=%s)",
+        owner, repo, default_branch,
+        bp.required_approving_review_count,
+        bp.enforce_admins,
+    )
+    return [bp]
 
-        try:
-            raw = await client.get_branch_protection(owner, repo, branch)
-        except Exception as exc:
-            logger.debug(
-                "Error checking branch protection for %s/%s:%s — %s",
-                owner, repo, branch, exc,
-            )
-            continue
-
-        if raw is None:
-            # No protection on this branch — that's normal
-            continue
-
-        bp = _parse_branch_protection(branch, raw)
-        protections.append(bp)
-        logger.debug(
-            "Collected branch protection for %s/%s:%s (reviews=%d, enforce_admins=%s)",
-            owner, repo, branch,
-            bp.required_approving_review_count,
-            bp.enforce_admins,
-        )
-
-    return protections
-
-
-def _unique_branches(default_branch: str) -> list[str]:
-    """Build deduplicated list of branches to check, default first."""
-    branches = [default_branch]
-    for b in DEFAULT_BRANCHES_TO_CHECK:
-        if b not in branches:
-            branches.append(b)
-    return branches
 
 
 def _parse_branch_protection(branch: str, raw: dict) -> BranchProtection:
@@ -208,67 +178,6 @@ def _extract_actor_logins(section: dict) -> list[str]:
 
 
 # ------------------------------------------------------------------
-# Collaborators
-# ------------------------------------------------------------------
-
-async def collect_collaborators(
-    client: GitHubClient,
-    owner: str,
-    repo: str,
-) -> list[Collaborator]:
-    """Collect all collaborators with their permission levels.
-
-    GitHub API returns permissions as a dict of booleans:
-      {"admin": true, "maintain": false, "push": true, "triage": true, "pull": true}
-    We convert to the highest applicable permission string.
-    """
-    raw_collabs = await client.list_collaborators(owner, repo)
-    collaborators: list[Collaborator] = []
-
-    for raw in raw_collabs:
-        login = raw.get("login", "")
-        cid = raw.get("id", 0)
-        permissions = raw.get("permissions", {})
-        role_name = raw.get("role_name", "")
-
-        # Determine highest permission level
-        permission = _highest_permission(permissions, role_name)
-
-        collaborators.append(Collaborator(
-            login=login,
-            id=cid,
-            permission=permission,
-        ))
-
-    logger.debug(
-        "Collected %d collaborators for %s/%s", len(collaborators), owner, repo
-    )
-    return collaborators
-
-
-def _highest_permission(permissions: dict, role_name: str = "") -> str:
-    """Determine the highest permission level from GitHub's permissions dict.
-
-    Check from highest to lowest: admin > maintain > write (push) > triage > read (pull).
-    Falls back to role_name if the permissions dict is empty.
-    """
-    if permissions.get("admin"):
-        return "admin"
-    if permissions.get("maintain"):
-        return "maintain"
-    if permissions.get("push"):
-        return "write"
-    if permissions.get("triage"):
-        return "triage"
-    if permissions.get("pull"):
-        return "read"
-    # Fallback to role_name if permissions dict was empty
-    if role_name:
-        return role_name
-    return "read"
-
-
-# ------------------------------------------------------------------
 # Rulesets
 # ------------------------------------------------------------------
 
@@ -277,32 +186,22 @@ async def collect_rulesets(
     owner: str,
     repo: str,
 ) -> list[Ruleset]:
-    """Collect repository rulesets. Returns empty list if not available."""
-    try:
-        raw_rulesets = await client.list_rulesets(owner, repo)
-    except Exception as exc:
-        logger.debug("Error collecting rulesets for %s/%s: %s", owner, repo, exc)
-        return []
+    """Collect repository rulesets."""
+    raw_rulesets = await client.list_rulesets(owner, repo)
 
-    rulesets: list[Ruleset] = []
-    for raw in raw_rulesets:
-        try:
-            rs = Ruleset(
-                id=raw.get("id", 0),
-                name=raw.get("name", ""),
-                enforcement=raw.get("enforcement", "disabled"),
-                target=raw.get("target", "branch"),
-                conditions=raw.get("conditions", {}),
-                rules=raw.get("rules", []),
-                bypass_actors=raw.get("bypass_actors", []),
-                raw=raw,
-            )
-            rulesets.append(rs)
-        except Exception as exc:
-            logger.warning(
-                "Failed to parse ruleset %s for %s/%s: %s",
-                raw.get("name", "?"), owner, repo, exc,
-            )
+    rulesets = [
+        Ruleset(
+            id=raw.get("id", 0),
+            name=raw.get("name", ""),
+            enforcement=raw.get("enforcement", "disabled"),
+            target=raw.get("target", "branch"),
+            conditions=raw.get("conditions", {}),
+            rules=raw.get("rules", []),
+            bypass_actors=raw.get("bypass_actors", []),
+            raw=raw,
+        )
+        for raw in raw_rulesets
+    ]
 
     logger.debug("Collected %d rulesets for %s/%s", len(rulesets), owner, repo)
     return rulesets

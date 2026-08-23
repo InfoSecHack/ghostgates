@@ -143,7 +143,11 @@ class RuleRegistry:
 
             try:
                 rule_findings = meta.func(gate)
-                findings.extend(rule_findings)
+                findings.extend(
+                    finding
+                    for finding in rule_findings
+                    if finding.min_privilege <= attacker_level
+                )
             except Exception as exc:
                 logger.error(
                     "Rule %s (%s) raised an exception on %s: %s",

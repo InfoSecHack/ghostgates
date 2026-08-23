@@ -152,7 +152,6 @@ def make_mock_org(
             - bp_dismiss_stale (bool): dismiss stale reviews
             - environments (list[dict]): environment configs
             - workflows (list[dict]): raw workflow file configs
-            - collaborators (list[dict]): collaborator configs
 
     Returns:
         Dict with keys:
@@ -161,7 +160,6 @@ def make_mock_org(
             - environments: dict mapping "owner/repo" -> raw environments list
             - workflow_files: dict mapping "owner/repo" -> list of file entries
             - workflow_contents: dict mapping "owner/repo/path" -> raw YAML string
-            - collaborators: dict mapping "owner/repo" -> list of raw collaborator responses
             - rulesets: dict mapping "owner/repo" -> list of raw rulesets
             - actions_permissions: org-level actions permissions
             - oidc_template: org-level OIDC template
@@ -176,7 +174,6 @@ def make_mock_org(
         "environments": {},
         "workflow_files": {},
         "workflow_contents": {},
-        "collaborators": {},
         "rulesets": {},
         "actions_permissions": {
             "enabled_repositories": "all",
@@ -290,12 +287,6 @@ def make_mock_org(
                 dataset["workflow_contents"][f"{key}/{path}"] = yaml_content
             dataset["workflow_files"][key] = file_entries
 
-        # --- Collaborators ---
-        collab_configs = rc.get("collaborators", [
-            {"login": "admin-user", "id": 1, "permissions": {"admin": True, "maintain": True, "push": True, "triage": True, "pull": True}},
-            {"login": "dev-user", "id": 2, "permissions": {"admin": False, "maintain": False, "push": True, "triage": True, "pull": True}},
-        ])
-        dataset["collaborators"][key] = collab_configs
 
         # --- Rulesets ---
         dataset["rulesets"][key] = rc.get("rulesets", [])
@@ -354,17 +345,6 @@ def wire_mock_org(
                 f"/repos/{org}/{repo_name}/branches/{default_branch}/protection"
             ).respond(404, json={"message": "Not Found"})
 
-        # Other well-known branches — 404 unless explicitly set
-        for branch in ["master", "develop", "staging", "production"]:
-            bp_key2 = f"{key}/{branch}"
-            if bp_key2 in dataset["branch_protections"]:
-                router.get(
-                    f"/repos/{org}/{repo_name}/branches/{branch}/protection"
-                ).respond(200, json=dataset["branch_protections"][bp_key2])
-            else:
-                router.get(
-                    f"/repos/{org}/{repo_name}/branches/{branch}/protection"
-                ).respond(404, json={"message": "Not Found"})
 
         # Environments
         env_list = dataset["environments"].get(key, [])
@@ -391,11 +371,6 @@ def wire_mock_org(
                 f"/repos/{org}/{repo_name}/contents/{path}"
             ).respond(200, text=content, headers={"Content-Type": "application/vnd.github.raw+json"})
 
-        # Collaborators
-        collabs = dataset["collaborators"].get(key, [])
-        router.get(
-            f"/repos/{org}/{repo_name}/collaborators"
-        ).respond(200, json=collabs)
 
         # Rulesets
         rulesets = dataset["rulesets"].get(key, [])
@@ -407,6 +382,9 @@ def wire_mock_org(
         repo_perms = dataset["repo_actions_permissions"].get(key, {})
         router.get(
             f"/repos/{org}/{repo_name}/actions/permissions"
+        ).respond(200, json=repo_perms)
+        router.get(
+            f"/repos/{org}/{repo_name}/actions/permissions/workflow"
         ).respond(200, json=repo_perms)
 
 

@@ -4,8 +4,8 @@ ghostgates/cli.py
 Command-line interface for GhostGates.
 
 Commands:
-  scan       Scan an org's repos for gate bypasses
-  list-rules List all registered bypass rules
+  scan       Collect GitHub configuration and evaluate inference rules
+  list-rules List all registered inference rules
   show       Show a stored scan result
   offline    Run rules against stored gate models (no API calls)
 
@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from ghostgates.models.enums import AttackerLevel
-from ghostgates.models.findings import ScanResult
+from ghostgates.models.findings import ScanResult, ScanScope
 
 
 def main() -> int:
@@ -75,14 +75,14 @@ def main() -> int:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ghostgates",
-        description="GhostGates — CI/CD gate bypass analysis engine",
+        description="GhostGates — GitHub security-control research prototype",
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
 
     subs = parser.add_subparsers(dest="command")
 
     # --- scan ---
-    scan_p = subs.add_parser("scan", help="Scan an org for gate bypasses")
+    scan_p = subs.add_parser("scan", help="Collect configuration and infer potential bypass paths")
     scan_p.add_argument("--org", required=True, help="GitHub organization name")
     scan_p.add_argument(
         "--token",
@@ -93,7 +93,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--attacker",
         default="org-owner",
         choices=[a.value for a in AttackerLevel],
-        help="Attacker level to simulate (default: org-owner)",
+        help="Maximum attacker prerequisite to include (default: org-owner)",
     )
     scan_p.add_argument(
         "--repos",
@@ -119,7 +119,7 @@ def _build_parser() -> argparse.ArgumentParser:
     scan_p.add_argument(
         "-v", "--verbose",
         action="store_true",
-        help="Show detailed bypass paths and remediation",
+        help="Show detailed inferred paths and remediation",
     )
     scan_p.add_argument(
         "--db",
@@ -134,11 +134,11 @@ def _build_parser() -> argparse.ArgumentParser:
     scan_p.add_argument(
         "--rank",
         action="store_true",
-        help="Show risk ranking table after scan",
+        help="Show heuristic review-priority table after scan",
     )
 
     # --- list-rules ---
-    rules_p = subs.add_parser("list-rules", help="List all registered bypass rules")
+    rules_p = subs.add_parser("list-rules", help="List all registered inference rules")
     rules_p.add_argument(
         "--format",
         default="terminal",
@@ -193,7 +193,7 @@ def _build_parser() -> argparse.ArgumentParser:
     diff_p.add_argument("--new-id", type=int, default=None, help="Specific new scan ID (default: latest)")
 
     # --- rank ---
-    rank_p = subs.add_parser("rank", help="Rank repos by risk score from last scan")
+    rank_p = subs.add_parser("rank", help="Rank repos by a heuristic review score")
     rank_p.add_argument("--org", required=True)
     rank_p.add_argument("--db", default="ghostgates.db")
     rank_p.add_argument("--top", type=int, default=20, help="Show top N repos (default: 20)")
@@ -221,7 +221,7 @@ def _build_parser() -> argparse.ArgumentParser:
                          help="Use stored gate models (no API calls)")
 
     # --- recon ---
-    recon_p = subs.add_parser("recon", help="Attack surface view — findings grouped by offensive question")
+    recon_p = subs.add_parser("recon", help="Group findings by security-review question")
     recon_p.add_argument("--org", required=True)
     recon_p.add_argument("--db", default="ghostgates.db")
     recon_p.add_argument(
@@ -232,7 +232,7 @@ def _build_parser() -> argparse.ArgumentParser:
     recon_p.add_argument("-o", "--output", default=None, help="Write output to file")
 
     # --- graph ---
-    graph_p = subs.add_parser("graph", help="Kill chain visualization — Mermaid attack path diagrams")
+    graph_p = subs.add_parser("graph", help="Visualize finding prerequisites and potential consequences")
     graph_p.add_argument("--org", required=True)
     graph_p.add_argument("--db", default="ghostgates.db")
     graph_p.add_argument(
@@ -251,7 +251,7 @@ def _build_parser() -> argparse.ArgumentParser:
 # ------------------------------------------------------------------
 
 async def _cmd_scan(args) -> int:
-    """Execute a live scan against GitHub API."""
+    """Collect configuration from the GitHub API and evaluate rules."""
     from ghostgates.client.github_client import GitHubClient
     from ghostgates.collectors.assembly import collect_org_gate_models
     from ghostgates.engine import registry
@@ -271,20 +271,16 @@ async def _cmd_scan(args) -> int:
 
     # --- Collect ---
     async with GitHubClient(token=token) as client:
-        gate_models, collect_errors = await collect_org_gate_models(
+        collection = await collect_org_gate_models(
             client,
             org,
             include_forks=args.include_forks,
             repo_filter=repo_filter,
         )
 
-    if collect_errors:
-        for err in collect_errors:
-            logging.getLogger("ghostgates").warning("Collection error: %s", err)
-
-    if not gate_models:
-        print(f"No repos found for org '{org}'.", file=sys.stderr)
-        return 1
+    gate_models = collection.gate_models
+    for error in collection.errors:
+        logging.getLogger("ghostgates").warning("Collection error: %s", error)
 
     print(f"Collected {len(gate_models)} repos. Running rules...", file=sys.stderr)
 
@@ -296,6 +292,8 @@ async def _cmd_scan(args) -> int:
         org=org,
         repos_scanned=len(gate_models),
         findings=findings,
+        errors=collection.errors,
+        scope=collection.scope,
         attacker_level=attacker,
         collected_at=datetime.now(timezone.utc).isoformat(),
     )
@@ -319,7 +317,7 @@ async def _cmd_scan(args) -> int:
         print(format_rank_terminal(scores, org))
 
     # Exit code: 2 if critical/high findings, 1 if medium+, 0 if clean
-    return _exit_code(findings)
+    return _exit_code(findings, incomplete=not result.is_complete)
 
 
 def _cmd_list_rules(args) -> int:
@@ -371,10 +369,23 @@ def _cmd_offline(args) -> int:
     attacker = AttackerLevel(args.attacker)
     findings = registry.run_all_repos(gate_models, attacker_level=attacker)
 
+    repo_names = [model.full_name for model in gate_models]
+    collection_errors = list({
+        (error.collector, error.message, error.repo): error
+        for model in gate_models
+        for error in model.collection_errors
+    }.values())
     result = ScanResult(
         org=args.org,
         repos_scanned=len(gate_models),
         findings=findings,
+        errors=collection_errors,
+        scope=ScanScope(
+            discovered_repositories=repo_names,
+            selected_repositories=repo_names,
+            evaluated_repositories=repo_names,
+            enumeration_complete=True,
+        ),
         attacker_level=attacker,
         collected_at=datetime.now(timezone.utc).isoformat(),
     )
@@ -386,7 +397,7 @@ def _cmd_offline(args) -> int:
     output = _format_result(result, args.format, getattr(args, "verbose", False))
     _write_output(output, args.output)
 
-    return _exit_code(findings)
+    return _exit_code(findings, incomplete=not result.is_complete)
 
 
 def _cmd_show(args) -> int:
@@ -465,7 +476,7 @@ def _cmd_diff(args) -> int:
 
 
 def _cmd_rank(args) -> int:
-    """Rank repos by risk score from latest scan."""
+    """Order repos by an uncalibrated review-priority heuristic."""
     from ghostgates.storage import SQLiteStore
     from ghostgates.reporting.rank import score_repos, format_rank_terminal, format_rank_json
 
@@ -513,6 +524,10 @@ async def _cmd_audit(args) -> int:
         if not gate_models:
             print(f"No stored gate models for org '{args.org}'. Run a scan first.", file=sys.stderr)
             return 1
+        if any(model.collection_errors for model in gate_models):
+            print("Audit incomplete because stored evidence is incomplete.",
+                  file=sys.stderr)
+            return 3
     else:
         token = args.token
         if not token:
@@ -525,9 +540,22 @@ async def _cmd_audit(args) -> int:
         repos_filter = [r.strip() for r in args.repos.split(",") if r.strip()] or None
 
         async with GitHubClient(token=token) as client:
-            gate_models = await collect_org_gate_models(
-                client, args.org, repos=repos_filter,
+            collection = await collect_org_gate_models(
+                client, args.org, repo_filter=repos_filter,
             )
+
+        gate_models = collection.gate_models
+        for error in collection.errors:
+            logging.getLogger("ghostgates").warning("Collection error: %s", error)
+
+        if collection.errors or not collection.scope.is_complete:
+            print("Audit incomplete because required evidence could not be collected.",
+                  file=sys.stderr)
+            return 3
+
+        if not gate_models:
+            print(f"No repos found for org '{args.org}'.", file=sys.stderr)
+            return 1
 
         # Store for future offline use
         from ghostgates.storage import SQLiteStore
@@ -553,7 +581,7 @@ async def _cmd_audit(args) -> int:
 
 
 def _cmd_recon(args) -> int:
-    """Attack surface view — findings grouped by offensive question."""
+    """Group findings by security-review question."""
     from ghostgates.storage import SQLiteStore
     from ghostgates.reporting.recon import (
         build_recon,
@@ -584,7 +612,7 @@ def _cmd_recon(args) -> int:
 
 
 def _cmd_graph(args) -> int:
-    """Kill chain visualization — Mermaid attack path diagrams."""
+    """Visualize finding prerequisites and potential consequences."""
     from ghostgates.storage import SQLiteStore
     from ghostgates.reporting.graph import (
         build_org_graph,
@@ -646,8 +674,11 @@ def _write_output(output: str, filepath: str | None) -> None:
         print(output)
 
 
-def _exit_code(findings: list) -> int:
+def _exit_code(findings: list, *, incomplete: bool = False) -> int:
     """Determine exit code from findings severity."""
+    if incomplete:
+        return 3
+
     from ghostgates.models.enums import Severity
     severities = {f.severity for f in findings}
     if Severity.CRITICAL in severities or Severity.HIGH in severities:

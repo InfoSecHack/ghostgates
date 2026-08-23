@@ -12,7 +12,6 @@ from datetime import datetime, timezone
 
 from ghostgates.models.gates import (
     BranchProtection,
-    Collaborator,
     CustomProtectionRule,
     EnvironmentConfig,
     EnvironmentProtection,
@@ -41,7 +40,6 @@ def make_gate(
     workflow_permissions: WorkflowPermissions | None = None,
     workflows: list[WorkflowDefinition] | None = None,
     oidc: OIDCConfig | None = None,
-    collaborators: list[Collaborator] | None = None,
 ) -> GateModel:
     """Build a GateModel with defaults. Override any field."""
     return GateModel(
@@ -57,7 +55,6 @@ def make_gate(
         workflow_permissions=workflow_permissions or WorkflowPermissions(),
         workflows=workflows or [],
         oidc=oidc or OIDCConfig(),
-        collaborators=collaborators or [],
         collected_at=datetime.now(timezone.utc),
     )
 
@@ -109,6 +106,7 @@ def make_bp(
 def make_ruleset(
     name: str = "default-ruleset",
     *,
+    ruleset_id: int = 1,
     enforcement: str = "active",
     target: str = "branch",
     bypass_actors: list[dict] | None = None,
@@ -116,7 +114,7 @@ def make_ruleset(
 ) -> Ruleset:
     """Build a Ruleset."""
     return Ruleset(
-        id=1,
+        id=ruleset_id,
         name=name,
         enforcement=enforcement,
         target=target,
@@ -139,7 +137,6 @@ def make_environment(
     deployment_policy_type: str = "all",
     deployment_patterns: list[str] | None = None,
     custom_rules: list[CustomProtectionRule] | None = None,
-    has_secrets: bool = False,
 ) -> EnvironmentConfig:
     """Build an EnvironmentConfig."""
     return EnvironmentConfig(
@@ -151,7 +148,6 @@ def make_environment(
             patterns=deployment_patterns or [],
         ),
         custom_rules=custom_rules or [],
-        has_secrets=has_secrets,
         raw={"_test": True},
     )
 

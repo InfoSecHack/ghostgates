@@ -15,12 +15,10 @@ from ghostgates.collectors.org import collect_org_metadata
 from ghostgates.collectors.repos import (
     collect_repos,
     collect_branch_protections,
-    collect_collaborators,
     collect_rulesets,
     _parse_branch_protection,
-    _highest_permission,
 )
-from ghostgates.models.gates import BranchProtection, Collaborator, Ruleset
+from ghostgates.models.gates import BranchProtection, Ruleset
 
 
 # ------------------------------------------------------------------
@@ -125,23 +123,6 @@ def _make_branch_protection(
 
     return result
 
-
-def _make_collaborator(login: str, cid: int, *, admin: bool = False,
-                        maintain: bool = False, push: bool = False,
-                        triage: bool = False, pull: bool = True) -> dict:
-    """Generate a realistic GitHub collaborator API response."""
-    return {
-        "login": login,
-        "id": cid,
-        "permissions": {
-            "admin": admin,
-            "maintain": maintain,
-            "push": push,
-            "triage": triage,
-            "pull": pull,
-        },
-        "role_name": "",
-    }
 
 
 def _make_ruleset(name: str, enforcement: str = "active",
@@ -266,11 +247,6 @@ async def test_branch_protection_with_reviews(client, mock_router):
             reviews=2, dismiss_stale=True, codeowners=True, enforce_admins=True,
         ), headers=_rl_headers())
     )
-    # Other branches return 404
-    for branch in ["master", "develop", "staging", "production"]:
-        mock_router.get(f"/repos/org/repo/branches/{branch}/protection").mock(
-            return_value=httpx.Response(404, json={"message": "Not Found"}, headers=_rl_headers())
-        )
 
     protections = await collect_branch_protections(client, "org", "repo", "main")
     assert len(protections) == 1
@@ -285,50 +261,12 @@ async def test_branch_protection_with_reviews(client, mock_router):
 @pytest.mark.asyncio
 async def test_branch_protection_404_returns_empty(client, mock_router):
     """No protections on any branch returns empty list."""
-    for branch in ["main", "master", "develop", "staging", "production"]:
-        mock_router.get(f"/repos/org/repo/branches/{branch}/protection").mock(
-            return_value=httpx.Response(404, json={"message": "Not Found"}, headers=_rl_headers())
-        )
+    mock_router.get("/repos/org/repo/branches/main/protection").mock(
+        return_value=httpx.Response(404, json={"message": "Not Found"}, headers=_rl_headers())
+    )
 
     protections = await collect_branch_protections(client, "org", "repo", "main")
     assert protections == []
-
-
-@pytest.mark.asyncio
-async def test_branch_protection_multiple_branches(client, mock_router):
-    """Can collect protection from multiple branches."""
-    mock_router.get("/repos/org/repo/branches/main/protection").mock(
-        return_value=httpx.Response(200, json=_make_branch_protection(reviews=1), headers=_rl_headers())
-    )
-    mock_router.get("/repos/org/repo/branches/develop/protection").mock(
-        return_value=httpx.Response(200, json=_make_branch_protection(reviews=1, enforce_admins=True), headers=_rl_headers())
-    )
-    for branch in ["master", "staging", "production"]:
-        mock_router.get(f"/repos/org/repo/branches/{branch}/protection").mock(
-            return_value=httpx.Response(404, json={"message": "Not Found"}, headers=_rl_headers())
-        )
-
-    protections = await collect_branch_protections(client, "org", "repo", "main")
-    assert len(protections) == 2
-    branches = {bp.branch for bp in protections}
-    assert branches == {"main", "develop"}
-
-
-@pytest.mark.asyncio
-async def test_branch_protection_deduplicates_default(client, mock_router):
-    """If default_branch is 'main', don't check 'main' twice."""
-    # Should only get ONE call to /branches/main/protection
-    route = mock_router.get("/repos/org/repo/branches/main/protection").mock(
-        return_value=httpx.Response(200, json=_make_branch_protection(reviews=1), headers=_rl_headers())
-    )
-    for branch in ["master", "develop", "staging", "production"]:
-        mock_router.get(f"/repos/org/repo/branches/{branch}/protection").mock(
-            return_value=httpx.Response(404, json={"message": "Not Found"}, headers=_rl_headers())
-        )
-
-    protections = await collect_branch_protections(client, "org", "repo", "main")
-    assert len(protections) == 1
-    assert route.call_count == 1
 
 
 @pytest.mark.asyncio
@@ -339,10 +277,6 @@ async def test_branch_protection_bypass_actors_parsed(client, mock_router):
             reviews=1, bypass_users=["admin-user"],
         ), headers=_rl_headers())
     )
-    for branch in ["master", "develop", "staging", "production"]:
-        mock_router.get(f"/repos/org/repo/branches/{branch}/protection").mock(
-            return_value=httpx.Response(404, json={"message": "Not Found"}, headers=_rl_headers())
-        )
 
     protections = await collect_branch_protections(client, "org", "repo", "main")
     assert "user:admin-user" in protections[0].bypass_pull_request_allowances
@@ -397,70 +331,6 @@ def test_parse_protection_missing_sections():
     assert bp.required_approving_review_count == 0
     assert bp.enforce_admins is False
 
-
-# ==================================================================
-# Tests: collect_collaborators
-# ==================================================================
-
-@pytest.mark.asyncio
-async def test_collect_collaborators_maps_permissions(client, mock_router):
-    """Permission levels are correctly determined from GitHub API format."""
-    mock_router.get("/repos/org/repo/collaborators").mock(
-        return_value=httpx.Response(200, json=[
-            _make_collaborator("alice", 1, admin=True, push=True, pull=True),
-            _make_collaborator("bob", 2, push=True, pull=True),
-            _make_collaborator("carol", 3, maintain=True, push=True, pull=True),
-            _make_collaborator("dave", 4, triage=True, pull=True),
-            _make_collaborator("eve", 5, pull=True),
-        ], headers=_rl_headers())
-    )
-
-    collabs = await collect_collaborators(client, "org", "repo")
-    assert len(collabs) == 5
-
-    by_login = {c.login: c for c in collabs}
-    assert by_login["alice"].permission == "admin"
-    assert by_login["bob"].permission == "write"
-    assert by_login["carol"].permission == "maintain"
-    assert by_login["dave"].permission == "triage"
-    assert by_login["eve"].permission == "read"
-
-
-@pytest.mark.asyncio
-async def test_collect_collaborators_empty(client, mock_router):
-    """Empty collaborator list returns empty."""
-    mock_router.get("/repos/org/repo/collaborators").mock(
-        return_value=httpx.Response(200, json=[], headers=_rl_headers())
-    )
-
-    collabs = await collect_collaborators(client, "org", "repo")
-    assert collabs == []
-
-
-# ==================================================================
-# Tests: _highest_permission (unit)
-# ==================================================================
-
-def test_highest_permission_admin():
-    assert _highest_permission({"admin": True, "push": True, "pull": True}) == "admin"
-
-def test_highest_permission_maintain():
-    assert _highest_permission({"maintain": True, "push": True, "pull": True}) == "maintain"
-
-def test_highest_permission_push():
-    assert _highest_permission({"push": True, "pull": True}) == "write"
-
-def test_highest_permission_triage():
-    assert _highest_permission({"triage": True, "pull": True}) == "triage"
-
-def test_highest_permission_pull_only():
-    assert _highest_permission({"pull": True}) == "read"
-
-def test_highest_permission_empty_with_role_name():
-    assert _highest_permission({}, "write") == "write"
-
-def test_highest_permission_empty_default():
-    assert _highest_permission({}) == "read"
 
 
 # ==================================================================

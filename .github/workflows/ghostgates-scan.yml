@@ -1,4 +1,4 @@
-name: GhostGates CI/CD Security Scan
+name: GhostGates research scan
 
 on:
   schedule:
@@ -8,7 +8,7 @@ on:
 
 permissions:
   contents: read
-  security-events: write  # Required for SARIF upload
+  security-events: write
 
 jobs:
   ghostgates-scan:
@@ -17,32 +17,46 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Install GhostGates
-        run: |
-          git clone https://github.com/InfoSecHack/ghostgates.git /tmp/ghostgates
-          pip install -e /tmp/ghostgates
+      - name: Install checked-out GhostGates
+        run: pip install .
 
       - name: Run scan
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GHOSTGATES_TOKEN }}
         run: |
-          ghostgates scan --org ${{ github.repository_owner }} --format sarif -o results.sarif --rank
+          ghostgates scan --org ${{ github.repository_owner }} --repos ${{ github.event.repository.name }} --format sarif -o results.sarif
+
+      - name: Check scan completeness
+        id: completeness
+        if: ${{ always() && hashFiles('results.sarif') != '' }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+
+          with open("results.sarif", encoding="utf-8") as report:
+              run = json.load(report)["runs"][0]
+          complete = run.get("properties", {}).get("ghostgates/complete") is True
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"complete={str(complete).lower()}\n")
+          PY
 
       - name: Upload SARIF to GitHub Security
-        if: always()
+        if: ${{ always() && steps.completeness.outputs.complete == 'true' }}
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: results.sarif
           category: ghostgates
 
       - name: Upload scan artifact
-        if: always()
+        if: ${{ always() && hashFiles('results.sarif') != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: ghostgates-report

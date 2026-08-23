@@ -2,7 +2,7 @@
 
 Individual collectors:
   - org.py: org-level metadata (Actions perms, OIDC)
-  - repos.py: repo listing, branch protections, collaborators, rulesets
+  - repos.py: repo listing, branch protections, rulesets
   - environments.py: environment protection rules
   - workflows.py: workflow YAML parsing
   - assembly.py: orchestrates all collectors into GateModels

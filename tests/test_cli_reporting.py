@@ -12,6 +12,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -87,7 +88,7 @@ class TestTerminalFormatter:
             attacker_level=AttackerLevel.ORG_OWNER,
         )
         output = format_terminal(result)
-        assert "No bypass findings" in output
+        assert "not proof of absence" in output
 
     def test_verbose_mode(self):
         result = _make_result(1)
@@ -107,6 +108,15 @@ class TestTerminalFormatter:
         output = format_terminal(result)
         assert "org/repo-0" in output
         assert "org/repo-1" in output
+
+    def test_collection_errors_are_visibly_incomplete(self):
+        result = _make_result(0)
+        result.errors = ["org/hidden: 403 Forbidden"]
+
+        terminal = format_terminal(result)
+
+        assert "INCOMPLETE" in terminal
+        assert "403 Forbidden" in terminal
 
 
 # ==================================================================
@@ -170,7 +180,7 @@ class TestMarkdownFormatter:
             attacker_level=AttackerLevel.ORG_OWNER,
         )
         output = format_markdown(result)
-        assert "No bypass findings" in output
+        assert "not proof of absence" in output
 
     def test_severity_emojis(self):
         result = _make_result(3)
@@ -225,6 +235,81 @@ class TestCLI:
         )
         assert r.returncode == 1
         assert "token" in r.stderr.lower()
+
+    @pytest.mark.asyncio
+    async def test_partial_collection_is_preserved_and_fails_closed(self, monkeypatch):
+        import ghostgates.cli as cli
+        import ghostgates.client.github_client as client_module
+        import ghostgates.collectors.assembly as assembly
+        from tests.mocks.gate_models import make_gate
+
+        class FakeGitHubClient:
+            def __init__(self, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+        async def fake_collect(*args, **kwargs):
+            from ghostgates.models.findings import ScanScope
+            from ghostgates.models.gates import CollectionError
+
+            gate = make_gate(repo="visible")
+            return assembly.CollectionResult(
+                gate_models=[gate],
+                errors=[CollectionError(
+                    collector="environments",
+                    repo="test-org/hidden",
+                    message="403 Forbidden",
+                )],
+                scope=ScanScope(
+                    discovered_repositories=[
+                        "test-org/visible", "test-org/hidden",
+                    ],
+                    selected_repositories=[
+                        "test-org/visible", "test-org/hidden",
+                    ],
+                    evaluated_repositories=["test-org/visible"],
+                    enumeration_complete=True,
+                ),
+            )
+
+        captured = {}
+        monkeypatch.setattr(client_module, "GitHubClient", FakeGitHubClient)
+        monkeypatch.setattr(assembly, "collect_org_gate_models", fake_collect)
+        monkeypatch.setattr(
+            cli,
+            "_write_output",
+            lambda output, path: captured.setdefault("result", json.loads(output)),
+        )
+        args = SimpleNamespace(
+            token="token",
+            org="test-org",
+            attacker=AttackerLevel.ORG_OWNER.value,
+            repos=None,
+            include_forks=False,
+            no_store=True,
+            db=None,
+            format="json",
+            verbose=False,
+            output=None,
+            rank=False,
+        )
+
+        status = await cli._cmd_scan(args)
+
+        assert status == 3
+        assert captured["result"]["errors"] == [{
+            "collector": "environments",
+            "message": "403 Forbidden",
+            "repo": "test-org/hidden",
+        }]
+        assert captured["result"]["scope"]["evaluated_repositories"] == [
+            "test-org/visible",
+        ]
 
 
 # ==================================================================

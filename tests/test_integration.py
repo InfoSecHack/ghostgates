@@ -92,11 +92,6 @@ REPO_CONFIGS = [
         "bp_enforce_admins": False,
         "bp_dismiss_stale": False,
         "bp_codeowners": False,
-        "collaborators": [
-            {"login": "admin1", "id": 100, "permissions": {"admin": True, "maintain": True, "push": True, "triage": True, "pull": True}},
-            {"login": "admin2", "id": 101, "permissions": {"admin": True, "maintain": True, "push": True, "triage": True, "pull": True}},
-            {"login": "dev1", "id": 102, "permissions": {"admin": False, "maintain": False, "push": True, "triage": True, "pull": True}},
-        ],
     },
 
     # Repo 3: Dangerous workflow — pull_request_target + PR head checkout
@@ -220,12 +215,13 @@ class TestFullPipeline:
             wire_mock_org(router, ORG, org_dataset)
 
             async with GitHubClient(token=FAKE_TOKEN) as client:
-                gate_models, collect_errors = await collect_org_gate_models(
+                collection = await collect_org_gate_models(
                     client, ORG, include_forks=False
                 )
 
+            gate_models = collection.gate_models
             self.gate_models = gate_models
-            self.collect_errors = collect_errors
+            self.collect_errors = collection.errors
 
             # Run rules at max attacker level (org-owner sees everything)
             self.findings = registry.run_all_repos(
@@ -238,6 +234,8 @@ class TestFullPipeline:
                 repos_scanned=len(gate_models),
                 repos_skipped=1,  # archived repo
                 findings=self.findings,
+                errors=collection.errors,
+                scope=collection.scope,
                 attacker_level=AttackerLevel.ORG_OWNER,
                 collected_at=datetime.now(timezone.utc).isoformat(),
             )

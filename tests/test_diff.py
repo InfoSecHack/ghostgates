@@ -10,7 +10,7 @@ from ghostgates.models.enums import (
     GateType,
     Severity,
 )
-from ghostgates.models.findings import BypassFinding, ScanResult
+from ghostgates.models.findings import BypassFinding, ScanResult, ScanScope
 from ghostgates.reporting.diff import (
     ScanDiff,
     diff_scans,
@@ -40,13 +40,27 @@ def _finding(rule_id: str = "GHOST-BP-001", instance: str = "main", **kw) -> Byp
     return BypassFinding(**defaults)
 
 
-def _scan(findings: list[BypassFinding], org: str = "test-org") -> ScanResult:
+def _scan(
+    findings: list[BypassFinding],
+    org: str = "test-org",
+    errors: list | None = None,
+    scope: ScanScope | None = None,
+) -> ScanResult:
+    if scope is None:
+        repositories = sorted({finding.repo for finding in findings}) or ["org/repo"]
+        scope = ScanScope(
+            discovered_repositories=repositories,
+            selected_repositories=repositories,
+            evaluated_repositories=repositories,
+            enumeration_complete=True,
+        )
     return ScanResult(
         org=org,
-        repos_scanned=1,
+        repos_scanned=len(scope.evaluated_repositories),
         repos_skipped=0,
         findings=findings,
-        errors=[],
+        errors=errors or [],
+        scope=scope,
         scan_duration_seconds=0.1,
         attacker_level="org-owner",
         collected_at="2026-03-01T00:00:00Z",
@@ -116,6 +130,97 @@ class TestDiffScans:
         assert len(d.new_findings) == 1
         assert d.new_findings[0].instance == "b.yml#job2"
         assert len(d.unchanged_findings) == 1
+
+    def test_finding_from_removed_rule_is_unverified_not_resolved(self):
+        old = _scan([_finding("GHOST-BP-004")])
+        new = _scan([])
+
+        d = diff_scans(old, new, evaluated_rule_ids={"GHOST-BP-001"})
+
+        assert d.resolved_findings == []
+        assert [f.rule_id for f in d.unverified_findings] == ["GHOST-BP-004"]
+        parsed = json.loads(format_diff_json(d))
+        assert parsed["summary"]["unverified"] == 1
+
+    def test_missing_finding_in_incomplete_scan_is_unverified(self):
+        old = _scan([_finding("GHOST-BP-001")])
+        new = _scan([], errors=["org/repo: 403 Forbidden"])
+
+        d = diff_scans(old, new)
+
+        assert d.resolved_findings == []
+        assert [f.rule_id for f in d.unverified_findings] == ["GHOST-BP-001"]
+
+    def test_missing_repo_variants_are_unverified(self):
+        old = _scan([_finding()])
+        scopes = [
+            ScanScope(
+                discovered_repositories=["org/repo"],
+                selected_repositories=[],
+                evaluated_repositories=[],
+                enumeration_complete=True,
+            ),
+            ScanScope(
+                discovered_repositories=["org/renamed"],
+                selected_repositories=["org/renamed"],
+                evaluated_repositories=["org/renamed"],
+                enumeration_complete=True,
+            ),
+            ScanScope(
+                discovered_repositories=["org/repo"],
+                selected_repositories=["org/repo"],
+                evaluated_repositories=[],
+                enumeration_complete=True,
+            ),
+        ]
+
+        for scope in scopes:
+            diff = diff_scans(old, _scan([], scope=scope))
+            assert diff.resolved_findings == []
+            assert diff.unverified_findings == old.findings
+
+    def test_material_inference_change_is_reported(self):
+        old = _scan([_finding()])
+        new = _scan([_finding(
+            confidence=Confidence.MEDIUM,
+            min_privilege=AttackerLevel.REPO_WRITE,
+            evidence={"branch": "main", "enforce_admins": False},
+        )])
+
+        diff = diff_scans(old, new)
+
+        assert len(diff.changed_findings) == 1
+        summary = format_diff_terminal(diff)
+        assert "confidence HIGH → MEDIUM" in summary
+        assert "attacker prerequisite REPO-ADMIN → REPO-WRITE" in summary
+        assert "evidence changed" in summary
+
+    def test_ruleset_display_name_change_is_unchanged(self):
+        old = _scan([_finding(
+            instance="42",
+            evidence={"ruleset_id": 42, "ruleset_name": "old"},
+        )])
+        new = _scan([_finding(
+            instance="42",
+            evidence={"ruleset_id": 42, "ruleset_name": "renamed"},
+        )])
+
+        diff = diff_scans(old, new)
+
+        assert len(diff.unchanged_findings) == 1
+        assert diff.changed_findings == []
+
+    def test_severity_change_is_reported_as_changed(self):
+        old = _scan([_finding(severity=Severity.HIGH)])
+        new = _scan([_finding(severity=Severity.MEDIUM)])
+
+        d = diff_scans(old, new)
+
+        assert d.unchanged_findings == []
+        assert len(d.changed_findings) == 1
+        assert d.changed_findings[0].old.severity == Severity.HIGH
+        assert d.changed_findings[0].new.severity == Severity.MEDIUM
+        assert "HIGH → MEDIUM" in format_diff_terminal(d)
 
     def test_both_empty(self):
         d = diff_scans(_scan([]), _scan([]))

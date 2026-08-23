@@ -1,9 +1,9 @@
 """
 ghostgates/reporting/rank.py
 
-Risk scoring and repo ranking. Aggregates findings per repo into a
-weighted risk score that accounts for severity, attacker reachability,
-and high-value target indicators (OIDC, production environments).
+Heuristic repository review ordering. The weights are intentionally simple and
+are not calibrated risk, likelihood, exploitability, or impact measurements.
+They only help order GhostGates findings for human review.
 """
 
 from __future__ import annotations
@@ -24,16 +24,16 @@ _SEVERITY_WEIGHT: dict[Severity, int] = {
     Severity.INFO: 0,
 }
 
-_BONUS_EXTERNAL_PATH = 25   # any finding reachable by external attacker
-_BONUS_OIDC = 15            # OIDC findings → cloud credential risk
-_BONUS_PROD_ENV = 10        # production environment involved
+_BONUS_EXTERNAL_PATH = 25   # finding whose target-repo prerequisite is external
+_BONUS_OIDC = 15            # warrants comparison with a cloud trust policy
+_BONUS_PROD_ENV = 10        # production-named environment involved
 
 
 # ── Data model ───────────────────────────────────────────────────
 
 @dataclass
 class RepoRiskScore:
-    """Risk score for a single repository."""
+    """Uncalibrated review-priority score for a single repository."""
 
     repo: str
     score: int
@@ -77,7 +77,7 @@ class RepoRiskScore:
 # ── Scoring logic ────────────────────────────────────────────────
 
 def score_repos(findings: list[BypassFinding]) -> list[RepoRiskScore]:
-    """Group findings by repo and compute risk scores. Returns sorted descending."""
+    """Group findings by repo and compute heuristic review-priority points."""
     by_repo: dict[str, list[BypassFinding]] = defaultdict(list)
     for f in findings:
         by_repo[f.repo].append(f)
@@ -163,7 +163,7 @@ def format_rank_terminal(
 
     lines.append("")
     lines.append(f"{_BOLD}╔══════════════════════════════════════════════════════╗{_RESET}")
-    lines.append(f"{_BOLD}║  GhostGates Risk Ranking                             ║{_RESET}")
+    lines.append(f"{_BOLD}║  GhostGates Review Priority                          ║{_RESET}")
     lines.append(f"{_BOLD}╚══════════════════════════════════════════════════════╝{_RESET}")
     lines.append("")
     lines.append(f"  Organization:  {org}")
@@ -177,7 +177,7 @@ def format_rank_terminal(
 
     # Header
     lines.append(
-        f"  {_DIM}{'#':>3}  {'Repository':<40} {'Score':>5}  "
+        f"  {_DIM}{'#':>3}  {'Repository':<40} {'Pts':>5}  "
         f"{'Tier':<10} {'Findings':<12} {'Flags'}{_RESET}"
     )
     lines.append(f"  {'─' * 95}")
@@ -186,11 +186,11 @@ def format_rank_terminal(
         color = _TIER_COLOR.get(s.tier, "")
         flags: list[str] = []
         if s.has_external_path:
-            flags.append("⚠ external")
+            flags.append("external prerequisite")
         if s.has_oidc_finding:
-            flags.append("⚠ OIDC")
+            flags.append("OIDC review")
         if s.has_prod_env:
-            flags.append("⚠ prod")
+            flags.append("prod-named")
         flag_str = "  ".join(flags)
 
         lines.append(
@@ -208,7 +208,7 @@ def format_rank_terminal(
 
     lines.append("")
     lines.append(
-        f"  Total risk: {_BOLD}{total_score}{_RESET} across {len(scores)} repos"
+        f"  Total priority points: {_BOLD}{total_score}{_RESET} across {len(scores)} repos"
     )
     if crit_repos:
         lines.append(f"  {_RED}{crit_repos} CRITICAL-tier repos{_RESET}")
@@ -216,24 +216,27 @@ def format_rank_terminal(
         lines.append(f"  {_YELLOW}{high_repos} HIGH-tier repos{_RESET}")
     lines.append("")
 
+    lines.append(f"  {_DIM}Heuristic only; points and tiers are not calibrated risk.{_RESET}")
+
     return "\n".join(lines)
 
 
 def format_rank_json(scores: list[RepoRiskScore], org: str) -> str:
-    """JSON ranking output."""
+    """JSON review-priority output."""
     import json
 
     return json.dumps(
         {
             "org": org,
             "repos_ranked": len(scores),
-            "total_risk_score": sum(s.score for s in scores),
+            "scoring_method": "uncalibrated-review-priority-v1",
+            "total_priority_points": sum(s.score for s in scores),
             "rankings": [
                 {
                     "rank": i,
                     "repo": s.repo,
-                    "score": s.score,
-                    "tier": s.tier,
+                    "priority_points": s.score,
+                    "priority_tier": s.tier,
                     "critical": s.critical,
                     "high": s.high,
                     "medium": s.medium,

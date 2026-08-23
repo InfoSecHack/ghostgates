@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+
+from ruamel.yaml import YAML
 
 from ghostgates.models.enums import (
     AttackerLevel,
@@ -10,7 +13,7 @@ from ghostgates.models.enums import (
     GateType,
     Severity,
 )
-from ghostgates.models.findings import BypassFinding, ScanResult
+from ghostgates.models.findings import BypassFinding, ScanResult, ScanScope
 from ghostgates.reporting.sarif import format_sarif
 
 
@@ -42,13 +45,19 @@ def _finding(
     return BypassFinding(**defaults)
 
 
-def _scan(findings: list[BypassFinding]) -> ScanResult:
+def _scan(findings: list[BypassFinding], errors: list[str] | None = None) -> ScanResult:
     return ScanResult(
         org="test-org",
         repos_scanned=1,
         repos_skipped=0,
         findings=findings,
-        errors=[],
+        errors=errors or [],
+        scope=ScanScope(
+            discovered_repositories=["org/repo"],
+            selected_repositories=["org/repo"],
+            evaluated_repositories=["org/repo"],
+            enumeration_complete=True,
+        ),
         scan_duration_seconds=0.5,
         attacker_level="org-owner",
         collected_at="2026-03-01T00:00:00Z",
@@ -114,12 +123,21 @@ class TestSarifRules:
         rule = run["tool"]["driver"]["rules"][0]
         assert rule["defaultConfiguration"]["level"] == "error"
 
-    def test_rule_security_severity(self):
-        run = json.loads(format_sarif(_scan([
-            _finding(severity=Severity.CRITICAL),
-        ])))["runs"][0]
-        rule = run["tool"]["driver"]["rules"][0]
-        assert rule["properties"]["security-severity"] == "9.5"
+    def test_security_severity_maps_qualitative_categories(self):
+        cases = [
+            (Severity.CRITICAL, "9.1"),
+            (Severity.HIGH, "7.0"),
+            (Severity.MEDIUM, "4.0"),
+            (Severity.LOW, "0.1"),
+            (Severity.INFO, "0.0"),
+        ]
+        for severity, expected in cases:
+            run = json.loads(format_sarif(_scan([
+                _finding(severity=severity),
+            ])))["runs"][0]
+            properties = run["tool"]["driver"]["rules"][0]["properties"]
+            assert properties["security-severity"] == expected
+            assert properties["ghostgates/severity-mapping"] == "qualitative-category"
 
     def test_rule_has_help_uri(self):
         run = json.loads(format_sarif(_scan([_finding()])))["runs"][0]
@@ -186,6 +204,7 @@ class TestSarifResults:
         props = run["results"][0]["properties"]
         assert "settings_url" in props
         assert "github.com" in props["settings_url"]
+        assert "fixes" not in run["results"][0]
 
 
 class TestSarifLocations:
@@ -251,3 +270,76 @@ class TestSarifEdgeCases:
         assert run["results"][0]["ruleIndex"] == 0
         assert run["results"][1]["ruleIndex"] == 0
         assert len(run["tool"]["driver"]["rules"]) == 1
+
+    def test_ruleset_ids_produce_stable_fingerprints(self):
+        findings = [
+            _finding(
+                rule_id="GHOST-BP-006",
+                evidence={"ruleset_id": ruleset_id, "ruleset_name": "same"},
+                instance="",
+            )
+            for ruleset_id in (101, 202)
+        ]
+        run = json.loads(format_sarif(_scan(findings)))["runs"][0]
+
+        fingerprints = {
+            result["fingerprints"]["ghostgates/v1"] for result in run["results"]
+        }
+        assert len(fingerprints) == 2
+
+        renamed = findings[0].model_copy(update={
+            "evidence": {"ruleset_id": 101, "ruleset_name": "renamed"},
+        })
+        renamed.instance = ""
+        renamed.model_post_init(None)
+        renamed_run = json.loads(format_sarif(_scan([renamed])))["runs"][0]
+        assert (
+            renamed_run["results"][0]["fingerprints"]["ghostgates/v1"]
+            == run["results"][0]["fingerprints"]["ghostgates/v1"]
+        )
+
+    def test_partial_collection_marks_run_incomplete(self):
+        run = json.loads(format_sarif(_scan(
+            [_finding()],
+            errors=["org/hidden: 403 Forbidden"],
+        )))["runs"][0]
+        assert run["invocations"][0]["executionSuccessful"] is False
+        assert run["properties"]["ghostgates/complete"] is False
+        assert run["properties"]["ghostgates/collectionErrors"]
+
+    def test_zero_repo_scope_controls_completeness(self):
+        known_empty = ScanResult(
+            org="empty-org",
+            repos_scanned=0,
+            scope=ScanScope(enumeration_complete=True),
+            attacker_level=AttackerLevel.ORG_OWNER,
+        )
+        collapsed = ScanResult(
+            org="test-org",
+            repos_scanned=0,
+            scope=ScanScope(
+                requested_repositories=["test-org/missing"],
+                discovered_repositories=["test-org/missing"],
+                enumeration_complete=True,
+            ),
+            attacker_level=AttackerLevel.ORG_OWNER,
+        )
+
+        known_run = json.loads(format_sarif(known_empty))["runs"][0]
+        collapsed_run = json.loads(format_sarif(collapsed))["runs"][0]
+
+        assert known_run["properties"]["ghostgates/complete"] is True
+        assert collapsed_run["properties"]["ghostgates/complete"] is False
+
+    def test_example_workflow_withholds_incomplete_sarif(self):
+        workflow_path = (
+            Path(__file__).parents[1]
+            / ".github"
+            / "workflows"
+            / "ghostgates-scan.yml"
+        )
+        workflow = YAML(typ="safe").load(workflow_path.read_text(encoding="utf-8"))
+        steps = workflow["jobs"]["ghostgates-scan"]["steps"]
+        upload = next(step for step in steps if step["name"] == "Upload SARIF to GitHub Security")
+
+        assert "steps.completeness.outputs.complete == 'true'" in upload["if"]
